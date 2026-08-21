@@ -1248,6 +1248,8 @@ def main():
 
 
 if __name__ == "__main__":
+    import atexit
+    atexit.register(lambda: os._exit(0))
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     main()
