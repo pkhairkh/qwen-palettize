@@ -827,13 +827,17 @@ def load_state(model, resume_dir):
             indices = load_indices(idx_path, N, K).to(mod.indices.device)
             mod.indices = indices.long()
             mod.indices_int8 = indices.to(torch.int8).contiguous()
-            # Update index_logits to match (one-hot from loaded indices)
+            # Update index_logits — SOFT one-hot (±1, not ±10) so gradients flow.
+            # STE (in fused_lut_linear_cuda.py) keeps forward=hard (cos preserved).
+            # Soft logits make P non-degenerate → grad_logits is non-zero.
+            # At ±10: P[non-argmax]≈0.00003 → grad≈0 (indices frozen).
+            # At ±1:   P[non-argmax]≈0.09    → grad flows (indices train).
             if mod.index_logits is not None:
                 with torch.no_grad():
-                    mod.index_logits.data.fill_(-10.0)
+                    mod.index_logits.data.fill_(-1.0)
                     for k in range(4):
                         mask = (indices == k)
-                        mod.index_logits.data[k][mask] = 10.0
+                        mod.index_logits.data[k][mask] = 1.0
                     mod.index_logits.data = mod.index_logits.data.to(torch.float16)
             n_loaded += 1
         else:
@@ -1228,10 +1232,10 @@ def main():
                     help="Directory to resume from (e.g. trained/superblock_0_best)")
     ap.add_argument("--use_soft_indices", type=int, default=1,
                     help="Enable trainable indices via Gumbel-Softmax (1=on, 0=off).")
-    ap.add_argument("--tau_init", type=float, default=0.1,
-                    help="Initial Gumbel-Softmax temperature. Default 0.1 (1.0 is too destructive).")
-    ap.add_argument("--tau_final", type=float, default=0.01,
-                    help="Final Gumbel-Softmax temperature (annealed over tau_anneal_steps).")
+    ap.add_argument("--tau_init", type=float, default=2.0,
+                    help="Initial Gumbel-Softmax temperature. Default 2.0 (high tau = soft = gradients flow).")
+    ap.add_argument("--tau_final", type=float, default=0.1,
+                    help="Final Gumbel-Softmax temperature. Default 0.1 (below this, gradients vanish).")
     ap.add_argument("--tau_anneal_steps", type=int, default=4000,
                     help="Steps over which to anneal temperature from tau_init to tau_final.")
     ap.add_argument("--shutdown_on_done", type=int, default=0,

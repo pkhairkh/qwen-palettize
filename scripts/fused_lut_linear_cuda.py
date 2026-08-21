@@ -571,10 +571,29 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         mod = _get_module()
         step_seed = _next_soft_step_seed()
 
-        # Call C++ soft fwd — returns (y, P, W)
-        y, P, W = mod.fused_lut_linear_soft_fwd(
+        # Call C++ soft fwd — returns (y, P, W_soft)
+        # W_soft = Σ_k P[k] * palette[g, k]  (soft blend, for gradient)
+        y_soft, P, W_soft = mod.fused_lut_linear_soft_fwd(
             x, palette, logits, group_size, float(tau), step_seed
         )
+
+        # ── STE: Straight-Through Gumbel-Softmax ──────────────────────────
+        # Forward uses HARD weight: W_hard = palette[argmax(logits)]
+        # Backward flows through SOFT weight: W_soft (non-zero gradients)
+        # W = W_hard - W_soft.detach() + W_soft
+        #   forward value = W_hard (exact one-hot → cos preserved)
+        #   backward grad  = through W_soft (indices actually train)
+        with torch.no_grad():
+            argmax_idx = logits.argmax(dim=0)  # (K, N) — hard index assignment
+            # Gather: W_hard[k, n] = palette[n // group_size, argmax_idx[k, n]]
+            group_idx = torch.arange(N, device=palette.device) // group_size
+            group_per_col = group_idx.unsqueeze(0).expand(K, N)  # (K, N)
+            W_hard = palette[group_per_col.long(), argmax_idx.long()].to(W_soft.dtype)  # (K, N) bf16
+        # STE trick: forward = W_hard, backward = through W_soft
+        W = W_hard - W_soft.detach() + W_soft
+        # Recompute y with the STE weight (original y_soft used W_soft)
+        y = torch.matmul(x, W)
+        del y_soft  # free the soft forward output
 
         # Add bias if provided
         if bias is not None:
