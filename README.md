@@ -41,7 +41,7 @@ qwen-palettize/
 
 ## Research Reports
 
-Five research agents investigated specific deficiencies. All reports are in their respective folders:
+Six research agents investigated specific deficiencies. All reports are in their respective folders:
 
 | Agent | Folder | Pages | Focus |
 |-------|--------|-------|-------|
@@ -50,8 +50,9 @@ Five research agents investigated specific deficiencies. All reports are in thei
 | Indices Training | `research-indices-training/` | 96 | Gumbel-Softmax audit, gradient flow, tau schedule, optimizer analysis |
 | Palettes Training | `research-palettes-training/` | 115 | Palette gradient correctness, precision, k-means vs gradient, loss function |
 | Architecture Review | `research-architecture-review/` | 162 | Systemic architecture issues, PartialWrapper, memory waste, refactoring roadmap |
+| **Literature Review** | **`research-literature-review/`** | **75** | **Comparative survey of 20 SOTA LLM quantization methods (GPTQ, AWQ, SqueezeLLM, AQLM, QuIP#, GPTVQ, BitNet, QLoRA, llama.cpp, ExLlamaV2, etc.) × 10 dimensions; gap analysis vs our approach; prioritized recommendations** |
 
-**Note:** Agent 6 (Literature Review) was not started. It should be launched separately.
+**Note:** Literature Review (`research-literature-review/`) was completed last, covering 20 SOTA methods across 10 dimensions. See `research-literature-review/00_executive_summary.md` for the gap analysis and `research-literature-review/08_recommendations.md` for the prioritized implementation plan.
 
 ## Quick Start
 
