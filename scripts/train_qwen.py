@@ -1164,15 +1164,32 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         if opt_muon: opt_muon.step()
         if opt_adamw: opt_adamw.step()
         if opt_indices: opt_indices.step()
-        # CRITICAL: clamp index_logits to safe fp16 range after step.
-        # Gumbel-Softmax grad at low tau can push fp32 master to ±1e6,
-        # which overflows fp16 (max 65504) → inf → NaN on next forward.
-        # Clamp to ±20 (softmax(20/0.1) is already numerically one-hot).
+        # CRITICAL: clamp index_logits after step to prevent both (a) fp16
+        # overflow on the next forward and (b) softmax saturation that zeroes
+        # the Gumbel-Softmax gradient. The clamp is ADAPTIVE to temperature:
+        #   par.data.clamp_(-5.0 * tau, 5.0 * tau)
+        # The previous fixed ±20 was a band-aid for (a) only — at the old
+        # tau=0.1 it caused (b): softmax(±20/0.1) = softmax(±200) overflows
+        # to [1, 0] in fp32 and the gradient is exactly zero (the documented
+        # cause of index freeze in research-filter-consolidation/
+        # 01_training_recipe.md §3).
+        # The new ±5τ clamp fixes both:
+        #   - At tau=2.0 (warmup):     clamp ±10   — loose, exploration
+        #   - At tau=0.5 (hold/floor): clamp ±2.5  — tight, commitment
+        #   - softmax(±5) ≈ [0.993, 0.007] — still essentially one-hot for
+        #     the forward pass, but with finite-precision gradient
+        #     (BNN-style tight clip from Courbariaux et al. 2016, applied
+        #     here in logit-space instead of weight-space).
+        # tau is in scope here because opt_indices is non-None only when
+        # use_soft_indices=True, which is the same condition that sets tau
+        # at the top of this iteration (see build_optimizers line 597 +
+        # the tau anneal block ~30 lines above).
         if opt_indices:
             with torch.no_grad():
                 for name, par in student.named_parameters():
                     if "index_logits" in name:
-                        par.data.clamp_(-20.0, 20.0)
+                        # Adaptive clamp: ±5τ (was ±20). See comment above.
+                        par.data.clamp_(-5.0 * tau, 5.0 * tau)
         if sched_muon: sched_muon.step()
         if sched_adamw: sched_adamw.step()
         if sched_indices: sched_indices.step()
