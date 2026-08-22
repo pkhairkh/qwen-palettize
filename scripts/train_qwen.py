@@ -658,6 +658,10 @@ def update_lrs(opt_muon, opt_adamw, hp, sb_idx, sched_muon=None, sched_adamw=Non
             if sched_adamw is not None and i < len(sched_adamw.base_lrs):
                 sched_adamw.base_lrs[i] = new_lr
     if opt_indices:
+        # opt_indices is bnb.optim.AdamW8bit (Patch 8) — NOT an FP32MasterOptimizer
+        # wrapper, so we access .param_groups DIRECTLY (not via .opt.param_groups).
+        # Round 1 fix: verified this matches scheduler init at line ~994 which
+        # uses LambdaLR(opt_indices, ...) — also no .opt wrapper.
         for i, g in enumerate(opt_indices.param_groups):
             group = g.get("group", "indices")
             new_lr = lrs.get(group, 1e-2)
