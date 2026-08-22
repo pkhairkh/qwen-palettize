@@ -112,3 +112,33 @@ Stage Summary:
 - Key finding: the redundant `y_soft = x @ W_soft` matmul (CUDA-era bug) is ALREADY eliminated by the prior Wave 1 Triton rewrite (commit `4e93ae3`); Patch 16's actual scope is narrower — eliminate the still-present W_soft *computation and HBM write* inside compute_P_W_ste_kernel. The kernel was writing W_soft to HBM "as a debug aid" but it was never consumed by the backward (which reconstructs it on-the-fly from P_aos + palette). Removing the W_soft store removes ~26MB write + ~26MB read per layer × 25 layers = ~1.3 GB/step HBM traffic.
 - Installed torch (CPU-only via --no-deps) + triton in venv for syntax + import checks (no GPU).
 - Beginning Patch 16 implementation.
+
+---
+Task ID: triton-2-wave1
+Agent: triton-kernels
+Task: Wave 1 — Patches 16 (eliminate redundant matmul) + 17 (buffer pooling). DoD: syntax + import checks pass, no redundant matmul, buffer pooling implemented, branch pushed.
+
+Work Log:
+- Sub-task 16a (Patch 16 — eliminate redundant W_soft store): identified that the prior Wave 1 Triton rewrite (commit 4e93ae3) had ALREADY eliminated the redundant y_soft = x @ W_soft matmul. The remaining waste was the W_soft COMPUTATION + HBM STORE inside compute_P_W_ste_kernel (the kernel was writing W_soft as a 'debug aid' even though the backward recomputes it on-the-fly from P_aos + palette). Removed W_soft computation + tl.store from compute_P_W_ste_kernel. Removed W_soft_ptr parameter. Updated compute_P_W_ste_triton() launcher to return (P_aos, W_ste) 2-tuple instead of 3-tuple. Updated TritonSoftLinear.forward to unpack 2-tuple. Updated bench_triton_kernels.py (4 call sites) + test_triton_soft_forward.py + test_triton_soft_backward.py for new API. Syntax check OK. Import check OK. Commit 44530fc.
+- Sub-task 17a (Patch 17 — buffer pooling): added module-level _P_POOL dict in triton_soft_forward.py keyed on (K, N, device.index). Added _get_pooled_buffers(K, N, device) helper that returns {'P_aos': tensor, 'W_ste': tensor}, allocating on first call per key. Added _POOLING_ENABLED flag (default True) + clear_P_pool() cleanup helper. Modified compute_P_W_ste_triton to use pooled buffers when enabled. Documented safety invariant: pooling is only safe under standard forward → backward → forward training (no retain_graph — Triton tl.store bypasses PyTorch's in-place modification detection). For the backward: added module-level _BWD_POOL dict in triton_soft_backward.py. Added _get_pooled_grad_W(K, N, device) helper. Added _BWD_POOL_ENABLED flag + clear_bwd_pool() helper. Modified fused_soft_bwd_grad_W_triton to use pooled grad_W. grad_W is safe to pool because it's an internal intermediate (consumed immediately by fused_soft_bwd_elementwise_triton within the same backward call — never saved in ctx, never returned upstream). grad_x, grad_logits, grad_palette CANNOT be pooled (returned to autograd). Syntax check OK. Import check OK. Commit 56ca124.
+- Sub-task w1-close: sent inbox messages to layer-fusion (1787434829-from-triton-kernels.md — API contract: compute_P_W_ste_triton returns 2-tuple, buffer pooling safety invariant, what to expect in Wave 2) and lora-fusion (1787434829-from-triton-kernels.md — backward API stable, guidance for Patch 20 to compute grad_W internally since Patch 18 will remove fused_soft_bwd_grad_W_triton). Updated PROGRESS.md: triton-kernels Wave 1 ✅, Patches 16+17 ✅ with commit hashes, event log entry, inbox summary updated. Commit e834401. Pushed all 3 commits to origin/agent/triton-kernels.
+
+Stage Summary:
+- Wave 1 DoD fully met. Branch pushed: agent/triton-kernels @ e834401.
+- Wave 1 commits: 44530fc (Patch 16) + 56ca124 (Patch 17) + e834401 (closeout).
+- Verified imports work in CPU-only environment (torch installed via --no-deps, triton pre-installed).
+- Beginning Wave 2: Patches 15 (batched compute_P_W) + 18 (chunked reduction).
+
+
+---
+Task ID: triton-3-wave2-read
+Agent: triton-kernels
+Task: Read Wave 2 research + design batched compute_P_W kernel (Patch 15) + chunked reduction kernel (Patch 18).
+
+Work Log:
+- Re-read research-kernel-efficiency/03_batched_compute_pw.md §2-3 (batched kernel design: grid (cdiv(max_K,BM), cdiv(max_N,BN), 25), blockIdx.z = layer_idx, PalettizedLayerDesc[25] tensor with per-layer K/N/palette_ptr/logits_ptr/seed_offset).
+- Re-read research-kernel-efficiency/05_memory_optimization.md §3.3 (chunked reduction: hold (K_CHUNK, N_TILE, 4) in shared memory, no grad_W HBM intermediate. K_CHUNK=64, N_TILE=32, M_TILE=128. Recommendation: do NOT fuse the matmul (cuBLAS GEMM is faster than scalar reduction); only fuse the elementwise part).
+
+Stage Summary:
+- Patch 15 design: new kernel compute_P_W_ste_batched_kernel takes a PalettizedLayerDesc[25] tensor (each desc = K, N, palette_ptr, logits_ptr, P_aos_ptr, W_ste_ptr, seed_offset) and processes all 25 layers in one launch via blockIdx.z. The existing single-layer compute_P_W_ste_triton stays for compatibility (layer-fusion may call it for one-off layers).
+- Patch 18 design: replace the two-kernel split (fused_soft_bwd_grad_W_triton + fused_soft_bwd_elementwise_triton) with a single fused kernel that computes grad_W = x.T @ grad_y via tl.dot, then immediately consumes it for grad_logits + grad_palette without writing to HBM. This requires changing the launcher API — fused_soft_bwd_grad_W_triton will be removed (informed lora-fusion in Wave 1 closeout message).
