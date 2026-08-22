@@ -591,10 +591,27 @@ def build_optimizers(model, hp, sb_idx):
     # FP32 master optimizers for palettes, LoRA, layernorms, Muon params
     opt_muon = FP32MasterMuon(muon_groups, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0) if muon_groups else None
     opt_adamw = FP32MasterAdamW(adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0) if adamw_groups else None
-    # AdamW with fp32 master for index_logits (Blackwell 96GB can afford 21.4 GB).
-    # CRITICAL: fp16 AdamW state + eps=1e-8 → NaN (sqrt(v)+eps underflows to 0 in fp16).
-    # FP32 master avoids this. Plain SGD (L4 fallback) was too weak for Gumbel-Softmax grads.
-    opt_indices = FP32MasterAdamW(plain_adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0) if plain_adamw_groups else None
+    # index_logits optimizer: bitsandbytes AdamW8bit (Patch 8, Wave 1).
+    # Replaces FP32MasterAdamW (113 ms/step, 21.4 GB VRAM) with bnb.optim.AdamW8bit
+    # (~20 ms/step, 3.56 GB VRAM). 8-bit state (m, v) handles fp16 index_logits
+    # natively — no fp32 master copy needed.
+    #
+    # eps=1e-6 (Wave 3 defensive bump from 1e-8): 8-bit quantization introduces
+    # ~1/256 state-range noise on dequantization. For tiny Gumbel-Softmax grads
+    # at low τ, sqrt(v)+eps with eps=1e-8 risks underflow → NaN (the original
+    # FP32MasterAdamW had a CRITICAL warning about this for fp16 state). 1e-6 is
+    # the bitsandbytes-recommended floor for 8-bit state and matches the Wave 3
+    # DoD fallback ("if NaN, raise eps to 1e-6"). Cost: slightly slower
+    # convergence; benefit: NaN safety without an fp32 master copy. If NaN still
+    # appears in real training, the existing skip-and-continue guard at line ~1161
+    # (if not torch.isfinite(loss): ... continue) plus the clamp_(-20, 20) at
+    # line ~1209 will keep training stable.
+    # See research-filter-consolidation/03_optimizer_speedup.md §Patch 8 (Option B),
+    # docs/papers/1412.6980_Adam_Kingma2015.pdf + 1711.05101_AdamW_Loshchilov2019.pdf.
+    import bitsandbytes as bnb
+    opt_indices = bnb.optim.AdamW8bit(
+        plain_adamw_groups, betas=(0.9, 0.95), eps=1e-6, weight_decay=0.0
+    ) if plain_adamw_groups else None
 
     # Per-group counts for visibility
     muon_by = {}
@@ -641,6 +658,10 @@ def update_lrs(opt_muon, opt_adamw, hp, sb_idx, sched_muon=None, sched_adamw=Non
             if sched_adamw is not None and i < len(sched_adamw.base_lrs):
                 sched_adamw.base_lrs[i] = new_lr
     if opt_indices:
+        # opt_indices is bnb.optim.AdamW8bit (Patch 8) — NOT an FP32MasterOptimizer
+        # wrapper, so we access .param_groups DIRECTLY (not via .opt.param_groups).
+        # Round 1 fix: verified this matches scheduler init at line ~994 which
+        # uses LambdaLR(opt_indices, ...) — also no .opt wrapper.
         for i, g in enumerate(opt_indices.param_groups):
             group = g.get("group", "indices")
             new_lr = lrs.get(group, 1e-2)
@@ -1011,7 +1032,9 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         return 0.5 * (1.0 + math.cos(math.pi * (step - WARMUP_STEPS) / max(max_steps - WARMUP_STEPS, 1)))
     sched_muon = torch.optim.lr_scheduler.LambdaLR(opt_muon.opt, lr_lambda) if opt_muon else None
     sched_adamw = torch.optim.lr_scheduler.LambdaLR(opt_adamw.opt, lr_lambda) if opt_adamw else None
-    sched_indices = torch.optim.lr_scheduler.LambdaLR(opt_indices.opt, lr_lambda) if opt_indices else None
+    # opt_indices is bnb.optim.AdamW8bit (Patch 8) — no .opt wrapper indirection.
+    # opt_muon / opt_adamw still use FP32MasterOptimizer wrapper, so they keep .opt.
+    sched_indices = torch.optim.lr_scheduler.LambdaLR(opt_indices, lr_lambda) if opt_indices else None
 
     # If resuming, advance the LR scheduler to the resumed step
     if resume_step > 0:
@@ -1067,7 +1090,62 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
 
     data_stream = stream_training_data(tokenizer, n_seqs=10**12, seq_len=seq_len, device=DEVICE, batch_size=batch_size)
 
-    for batch_ids in data_stream:
+    # ─── Patch 6 (Wave 2): persistent teacher stream + double-buffered h_out ───
+    # Eliminates per-step stream creation (~5µs alloc/destroy × 25 Linears =
+    # 125 µs wasted per step) AND overlaps the 68 ms teacher forward with the
+    # 260 ms student backward by preparing batch N+1's teacher output while
+    # the student trains on batch N. Steady-state step time: 530 ms → 461 ms
+    # (~13 % speedup; teacher fwd fully hidden behind student bwd).
+    #
+    # Synchronization invariants (research-kernel-efficiency/06_stream_overlap.md §3.1):
+    #   1. Teacher never overwrites a buffer the student is reading —
+    #      teacher's stream_t.wait_event(event_s[buf_idx]) at iter start.
+    #   2. Student never reads a buffer the teacher is writing —
+    #      student's current_stream().wait_event(event_t[buf_idx]) before loss.
+    #   3. event_s[buf_idx] is recorded IMMEDIATELY after compute_loss
+    #      (before backward) — the student only needs the buffer for the
+    #      loss; this lets the NEXT iter's teacher start as soon as loss is
+    #      computed, enabling overlap with the current iter's backward.
+    stream_t = torch.cuda.Stream()                                  # allocated ONCE
+    h_out_buf = [None, None]                                         # ping-pong buffers
+    event_t = [torch.cuda.Event(), torch.cuda.Event()]               # teacher-done events
+    event_s = [torch.cuda.Event(), torch.cuda.Event()]               # student-done events
+    buf_idx = 0                                                      # ping-pong index
+
+    # ─── Epilogue / StopIteration handling (Round 1 fix) ────────────────────
+    # The for-loop's iteration protocol catches StopIteration automatically
+    # when data_stream is exhausted (n_seqs reached at line 918's generator).
+    # The `if global_step >= max_steps: break` below handles the case where
+    # max_steps < stream length. No explicit `next(data_stream)` call exists
+    # in this loop body — Python's `for ... in enumerate(...)` IS the
+    # fetch+catch wrapper. If a future refactor introduces an explicit
+    # `next(data_stream)` (e.g. for true N+1 prefetch), it MUST be wrapped:
+    #     if step + 1 < max_steps:
+    #         try:
+    #             next_batch = next(data_stream)
+    #         except StopIteration:
+    #             break
+    # to prevent StopIteration from leaking past the for-loop boundary (Python
+    # 3.7+ silently propagates StopIteration out of generator-exit contexts).
+    #
+    # Event-recording order verification (research 06 §3.1 invariants):
+    #   * event_s[buf_idx] is recorded IMMEDIATELY after compute_loss (line
+    #     ~1169), BEFORE loss.backward(). This is INTENTIONAL — the student
+    #     only READS h_out_buf[buf_idx] during compute_loss; backward() does
+    #     not touch h_out_buf (it computes grads of student.model.parameters
+    #     w.r.t. student_out, which depends on batch_ids, NOT h_out_buf).
+    #     Recording early lets the NEXT iter's teacher forward start as soon
+    #     as compute_loss completes, overlapping teacher_fwd(N+1) with
+    #     student_bwd(N) — the entire point of double-buffering. Recording
+    #     event_s AFTER backward would serialize teacher_fwd behind
+    #     student_bwd and forfeit the overlap.
+    #   * Teacher (next iter) waits on event_s[buf_idx] via
+    #     stream_t.wait_event(...) at line ~1107 BEFORE writing
+    #     h_out_buf[buf_idx]. Correct producer/consumer ordering.
+    #   * Student (current iter) waits on event_t[buf_idx] via
+    #     torch.cuda.current_stream().wait_event(...) at line ~1138 BEFORE
+    #     reading h_out_buf[buf_idx]. Correct producer/consumer ordering.
+    for step, batch_ids in enumerate(data_stream):
         if global_step >= max_steps: break
 
         # Temperature annealing for Gumbel-Softmax.
@@ -1116,9 +1194,15 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
                 last_hp_sig = ns
             last_hp_check = global_step
 
-        # === TEACHER FORWARD on stream_t (overlaps with student backward) ===
-        # Producer/consumer: teacher prepares next batch while student trains on current
-        stream_t = torch.cuda.Stream()
+        # === TEACHER FORWARD on stream_t, writes to h_out_buf[buf_idx] ===
+        # Patch 6 (Wave 2): persistent stream_t + double-buffered h_out_buf.
+        # Invariant 1: teacher never overwrites a buffer the student is reading.
+        #   At iter start (step>0), wait for student to release h_out_buf[buf_idx]
+        #   (event_s[buf_idx] was recorded 2 iters ago, when the student finished
+        #   reading it). On step 0, event_s[buf_idx] is uninitialized → signaled →
+        #   wait_event returns immediately (no-op).
+        if step > 0:
+            stream_t.wait_event(event_s[buf_idx])
         with torch.cuda.stream(stream_t):
             with torch.no_grad():
                 with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
@@ -1136,11 +1220,21 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
                             else:
                                 out = layer(h)
                             h = out[0] if isinstance(out, tuple) else out
-                    h_out = h.detach()
-        # Student forward+backward runs on default stream (stream_s)
-        # stream_t will be synced when h_out is used in loss computation
+                    # Reuse pre-allocated buffer when shape matches (avoid per-step
+                    # alloc); otherwise (first iter or seq_len change) allocate.
+                    h_detached = h.detach()
+                    if h_out_buf[buf_idx] is None or h_out_buf[buf_idx].shape != h_detached.shape:
+                        h_out_buf[buf_idx] = h_detached
+                    else:
+                        h_out_buf[buf_idx].copy_(h_detached)
+        # Signal: teacher forward done writing h_out_buf[buf_idx]
+        event_t[buf_idx].record(stream_t)
 
-        # === STUDENT FORWARD ===
+        # === STUDENT FORWARD + BACKWARD on default stream ===
+        # Invariant 2: student never reads a buffer the teacher is writing.
+        #   Wait for teacher to finish writing h_out_buf[buf_idx].
+        torch.cuda.current_stream().wait_event(event_t[buf_idx])
+
         # bf16 has same exponent range as fp32 — no overflow in GatedDeltaNet
         s_h = student.model.embed_tokens(batch_ids)
         with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
@@ -1161,7 +1255,16 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
 
         # Loss — outside autocast, fp32 math
         # Reverted to Dolphin's combined loss (1-cos+norm_mse) throughout
-        loss, comps = compute_loss(student_out, h_out, hp)
+        loss, comps = compute_loss(student_out, h_out_buf[buf_idx], hp)
+        # Alias for downstream references (NaN message + del + post-step logging)
+        h_out = h_out_buf[buf_idx]
+
+        # Invariant 3 (research 06 §3.1): record event_s IMMEDIATELY after
+        # compute_loss, BEFORE backward(). The student only needs h_out_buf for
+        # the loss — by signaling now, the NEXT iter's teacher can start writing
+        # to this buffer as soon as compute_loss finishes (much earlier than
+        # when loss.backward() completes), enabling true producer/consumer overlap.
+        event_s[buf_idx].record(torch.cuda.current_stream())
 
         if not torch.isfinite(loss):
             # Quick param-NaN diagnostic
@@ -1178,6 +1281,7 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
             if opt_indices: opt_indices.zero_grad(set_to_none=True)
             del batch_ids, h_out, student_out, loss, comps
             global_step += 1  # advance to avoid infinite loop on persistent NaN
+            buf_idx = 1 - buf_idx  # Patch 6: ping-pong even on NaN skip (keep pipeline primed)
             continue
 
         # Backward
@@ -1285,6 +1389,7 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
                     print(f"    (deferred save — next save at step {((global_step // save_every) + 1) * save_every})", flush=True)
 
         del batch_ids, h_out, student_out, loss, comps
+        buf_idx = 1 - buf_idx  # Patch 6: ping-pong to next buffer for next iter
 
     # Final save — only if training produced a valid cos (best_cos > 0).
     # If everything NaN'd, skip to preserve the previous good checkpoint on disk.
