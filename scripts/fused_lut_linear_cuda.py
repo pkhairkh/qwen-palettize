@@ -643,8 +643,9 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
             # PERF: skip grad_logits entirely when one-hot + low tau (grad is always 0).
             # Empirically verified at tau=0.1 with logits=±10: all 25 index_logits
             # grads are 0.0. The L4 "training" of indices was a no-op.
-            # Set SKIP_ZERO_GRAD_LOGITS=0 to force full computation (debugging).
-            skip_grad_logits = os.environ.get("SKIP_ZERO_GRAD_LOGITS", "1") == "1"
+            # Compute grad_logits by default (STE makes it non-zero).
+            # Set SKIP_ZERO_GRAD_LOGITS=1 to skip (legacy behavior, for benchmarking).
+            skip_grad_logits = os.environ.get("SKIP_ZERO_GRAD_LOGITS", "0") == "1"
 
             # grad_palette only needs grad_W * P (cheaper than full grad_logits path)
             # Use bf16 matmul for grad_W (faster, sufficient precision for palette grad)

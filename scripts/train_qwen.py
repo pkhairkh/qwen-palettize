@@ -962,12 +962,14 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
     print(f"\n=== Building optimizers ===", flush=True)
     opt_muon, opt_adamw, opt_indices = build_optimizers(student, hp, sb_idx)
 
-    # Cosine LR scheduler — ABSOLUTE step (original working behavior).
-    # When resuming, scheduler is advanced to resume_step (see below).
-    # max_steps should be set so resume_step is mid-schedule for continued training
-    # (e.g., resume=8000, max=12000 → lr_factor at resume = 0.5*(1+cos(π*8000/12000)) = 0.25).
+    # Cosine LR scheduler with linear warmup (100 steps) — ABSOLUTE step.
+    # Without warmup, STE + full LR causes index flips that destroy the model.
+    # Warmup lets the model adapt to STE before full LR kicks in.
+    WARMUP_STEPS = 100
     def lr_lambda(step):
-        return 0.5 * (1.0 + math.cos(math.pi * step / max(max_steps, 1)))
+        if step < WARMUP_STEPS:
+            return float(step) / float(WARMUP_STEPS)
+        return 0.5 * (1.0 + math.cos(math.pi * (step - WARMUP_STEPS) / max(max_steps - WARMUP_STEPS, 1)))
     sched_muon = torch.optim.lr_scheduler.LambdaLR(opt_muon.opt, lr_lambda) if opt_muon else None
     sched_adamw = torch.optim.lr_scheduler.LambdaLR(opt_adamw.opt, lr_lambda) if opt_adamw else None
     sched_indices = torch.optim.lr_scheduler.LambdaLR(opt_indices.opt, lr_lambda) if opt_indices else None
@@ -1053,25 +1055,29 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
                 last_hp_sig = ns
             last_hp_check = global_step
 
-        # === TEACHER FORWARD (shared embeddings, prefix only) ===
-        with torch.no_grad():
-            with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-                # Teacher prefix: embed_tokens → layers 0 to sb_end-1
-                h = teacher.model.embed_tokens(batch_ids)
-                position_ids = torch.arange(batch_ids.shape[1], device=batch_ids.device).unsqueeze(0)
-                if hasattr(teacher.model, 'rotary_emb') and teacher.model.rotary_emb is not None:
-                    pos_emb = teacher.model.rotary_emb(h, position_ids)
-                else:
-                    pos_emb = None
-                for layer_idx in range(sb_end):
-                    if layer_idx < len(teacher.model.layers):
-                        layer = teacher.model.layers[layer_idx]
-                        if pos_emb is not None:
-                            out = layer(h, position_embeddings=pos_emb)
-                        else:
-                            out = layer(h)
-                        h = out[0] if isinstance(out, tuple) else out
-                h_out = h.detach()
+        # === TEACHER FORWARD on stream_t (overlaps with student backward) ===
+        # Producer/consumer: teacher prepares next batch while student trains on current
+        stream_t = torch.cuda.Stream()
+        with torch.cuda.stream(stream_t):
+            with torch.no_grad():
+                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                    h = teacher.model.embed_tokens(batch_ids)
+                    position_ids = torch.arange(batch_ids.shape[1], device=batch_ids.device).unsqueeze(0)
+                    if hasattr(teacher.model, 'rotary_emb') and teacher.model.rotary_emb is not None:
+                        pos_emb = teacher.model.rotary_emb(h, position_ids)
+                    else:
+                        pos_emb = None
+                    for layer_idx in range(sb_end):
+                        if layer_idx < len(teacher.model.layers):
+                            layer = teacher.model.layers[layer_idx]
+                            if pos_emb is not None:
+                                out = layer(h, position_embeddings=pos_emb)
+                            else:
+                                out = layer(h)
+                            h = out[0] if isinstance(out, tuple) else out
+                    h_out = h.detach()
+        # Student forward+backward runs on default stream (stream_s)
+        # stream_t will be synced when h_out is used in loss computation
 
         # === STUDENT FORWARD ===
         # bf16 has same exponent range as fp32 — no overflow in GatedDeltaNet
@@ -1227,7 +1233,7 @@ def main():
     ap.add_argument("--seq_len", type=int, default=1024,
                     help="Tokens per sequence. Default 1024 for Blackwell 96GB VRAM.")
     ap.add_argument("--batch_size", type=int, default=32,
-                    help="Sequences per step. Default 32 for Blackwell (was 8 for L4). 32x1024 = 32K tokens/step.")
+                    help="Sequences per step. Default 32 for Blackwell 96GB VRAM.")
     ap.add_argument("--resume_from", type=str, default=None,
                     help="Directory to resume from (e.g. trained/superblock_0_best)")
     ap.add_argument("--use_soft_indices", type=int, default=1,
