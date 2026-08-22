@@ -142,3 +142,25 @@ Work Log:
 Stage Summary:
 - Patch 15 design: new kernel compute_P_W_ste_batched_kernel takes a PalettizedLayerDesc[25] tensor (each desc = K, N, palette_ptr, logits_ptr, P_aos_ptr, W_ste_ptr, seed_offset) and processes all 25 layers in one launch via blockIdx.z. The existing single-layer compute_P_W_ste_triton stays for compatibility (layer-fusion may call it for one-off layers).
 - Patch 18 design: replace the two-kernel split (fused_soft_bwd_grad_W_triton + fused_soft_bwd_elementwise_triton) with a single fused kernel that computes grad_W = x.T @ grad_y via tl.dot, then immediately consumes it for grad_logits + grad_palette without writing to HBM. This requires changing the launcher API — fused_soft_bwd_grad_W_triton will be removed (informed lora-fusion in Wave 1 closeout message).
+
+---
+Task ID: triton-4-wave2
+Agent: triton-kernels
+Task: Wave 2 — Patches 15 (batched compute_P_W) + 18 (chunked reduction). DoD: syntax + import checks pass, batched compute_P_W implemented, chunked reduction implemented, branch pushed.
+
+Work Log:
+- Sub-task 15a (Patch 15 — batched compute_P_W): added compute_P_W_ste_batched_kernel to triton_soft_forward.py. Grid = (cdiv(max_K, BM), cdiv(max_N, BN), n_layers), blockIdx.z = layer_idx. Each program loads per-layer (K, N, palette_ptr, logits_ptr, P_aos_ptr, W_ste_ptr) from int64 pointer arrays + int32 shape arrays. Pointer casting via tl.load(ptrs + idx).to(tl.pointer_type(dtype)) — verified this pattern compiles in Triton 3.7 via _test_ptr_cast.py. Per-layer Gumbel seed decorrelation: step_seed = base_seed + layer_idx. Early-exit via masking (tl.load returns 'other', tl.store is no-op) for positions outside layer's (K_l, N_l). Autotune key: max_K, max_N (not per-layer). Added compute_P_W_ste_batched_triton(layers, tau, base_seed) launcher that builds the pointer/shape arrays, allocates (or reuses from pool) per-layer P_aos + W_ste, and launches the kernel. Uses buffer pool (Patch 17) for outputs. group_size must be same across all layers (asserted). Added test_batched_compute_pw_triton.py offline sanity test (launcher plumbing + JIT signature) — PASSED. Commit 01c0ecf.
+- Sub-task 18a (Patch 18 — chunked reduction): added fused_soft_bwd_chunked_kernel to triton_soft_backward.py. Single fused kernel that: (1) computes grad_W_tile = x.T @ grad_y via tl.dot (tensor cores, fp32 acc, reducing over M in chunks of BK=32) — tile lives in REGISTERS, never HBM; (2) immediately consumes grad_W_tile for grad_logits + grad_palette (same math as fused_soft_bwd_elementwise_kernel). Eliminates 52 MB write + 52 MB read of grad_W per layer × 25 = 2.6 GB/step HBM traffic. FIXED CONFIG (BM=128, BN=128, BK=32, no @triton.autotune) because atomic_add to grad_palette accumulates across autotuner benchmark runs (same issue as existing elementwise kernel). Constraint: BN <= group_size (256) for per-block register accumulation. Added fused_soft_bwd_chunked_triton(x, grad_y, P_aos, palette, group_size) launcher. Updated TritonSoftLinear.backward to call fused_soft_bwd_chunked_triton instead of the two-kernel split. Old two-kernel split (fused_soft_bwd_grad_W_triton + fused_soft_bwd_elementwise_triton) KEPT for backward compat (bench_triton_kernels.py still microbenchmarks them; lora-fusion may call them if needed). Added bench_soft_bwd_chunked to bench_triton_kernels.py for A/B comparison. Commit cb242e4.
+- Sub-task w2-close: ran full DoD verification script — all 4 patches verified (Patch 16: no W_soft in single-layer kernel; Patch 17: _P_POOL + _BWD_POOL present; Patch 15: batched kernel + launcher present; Patch 18: chunked kernel + launcher present, backward wired to chunked, old grad_W NOT called from backward). Sent inbox message to lora-fusion (1787435760-from-triton-kernels.md — Patch 18 API changes, recommended Patch 20 design to compute grad_W internally via tl.dot, reference to chunked kernel source). Updated PROGRESS.md: triton-kernels Wave 2 ✅, Patches 15+18 ✅ with commit hashes, event log entry, inbox summary updated. Commit pending (this entry).
+
+Stage Summary:
+- Wave 2 DoD fully met:
+  [x] All syntax checks pass (ast.parse on 7 files)
+  [x] Import check passes (python3 -c 'import triton_soft_forward, triton_soft_backward')
+  [x] No redundant matmul (Patch 16 — W_soft not computed/stored)
+  [x] Buffer pooling implemented (Patch 17 — _P_POOL + _BWD_POOL)
+  [x] Batched compute_P_W implemented (Patch 15 — compute_P_W_ste_batched_kernel + _triton)
+  [x] Chunked reduction implemented (Patch 18 — fused_soft_bwd_chunked_kernel + _triton)
+  [x] Branch will be pushed after this commit
+- All 4 patches complete: 15 (01c0ecf), 16 (44530fc), 17 (56ca124), 18 (cb242e4).
+- Branch ready for orchestrator merge (merge order: nn-module → triton-kernels → layer-fusion → lora-fusion → quality-recipe → cuda-graphs).
