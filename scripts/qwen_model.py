@@ -589,7 +589,7 @@ def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
 
 
 def capture_original_weights_from_checkpoint(sb_idx, model_name="Qwen/Qwen3.5-4B",
-                                              device="cpu"):
+                                              device="cuda"):
     """Load original fp16/bf16 weights from the HuggingFace checkpoint for the
     given super-block's layers, BEFORE palettization replaces the nn.Linear
     modules with PalettizedLinear. Used for LoftQ SVD initialization of LoRA
@@ -604,8 +604,9 @@ def capture_original_weights_from_checkpoint(sb_idx, model_name="Qwen/Qwen3.5-4B
     Returns:
         dict: {tensor_name: weight_tensor} where tensor_name is the full
         parameter name (e.g. "model.layers.0.linear_attn.in_proj_qkv.weight")
-        and weight_tensor is the original fp32 weight on `device` (CPU by
-        default to save VRAM during build).
+        and weight_tensor is the original weight on `device` (CUDA by default
+        so the SVD in QwenLoRA.__init__ runs on-GPU without a host→device copy
+        per-tensor).
 
     Memory:
         Temporarily loads the full HF model (Qwen3.5-4B ~8 GB on disk,
@@ -616,8 +617,9 @@ def capture_original_weights_from_checkpoint(sb_idx, model_name="Qwen/Qwen3.5-4B
     Args:
         sb_idx: super-block index (0-7). Captures layers SUPER_BLOCKS[sb_idx].
         model_name: HF model id (default "Qwen/Qwen3.5-4B").
-        device: where to place the captured weights ("cpu" saves VRAM;
-            QwenLoRA will .to(W_pal.device) them as needed during SVD init).
+        device: where to place the captured weights ("cuda" by default so
+            the SVD in QwenLoRA.__init__ runs on-GPU directly; the call
+            site in train_qwen.py also passes device=DEVICE explicitly).
     """
     from transformers import AutoModelForCausalLM
     import gc

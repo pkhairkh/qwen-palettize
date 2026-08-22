@@ -705,10 +705,12 @@ def build_student_super_block(sb_idx, lora_rank=16, lora_alpha=32, use_soft_indi
     # PalettizedLinear above — the original weights are gone from `model`.
     # The checkpoint is the only source of truth for pre-palettization weights.
     #
-    # Weights are kept on CPU (default) to save VRAM; QwenLoRA.__init__ moves
-    # them to W_pal.device per-tensor during SVD init (qwen_model.py:217).
+    # Weights are placed on DEVICE (= "cuda") explicitly so the SVD inside
+    # QwenLoRA.__init__ (qwen_model.py:217-222) runs on-GPU directly without
+    # a host→device copy per-tensor. This matches the function default but is
+    # passed explicitly for clarity at the call site.
     from qwen_model import capture_original_weights_from_checkpoint
-    original_weights = capture_original_weights_from_checkpoint(sb_idx)
+    original_weights = capture_original_weights_from_checkpoint(sb_idx, device=DEVICE)
 
     # Attach LoRA on ALL palettized Linears.
     # Use rank-32 for the 5 worst-cosine Linears (from calib_sb0.log),
