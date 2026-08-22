@@ -47,7 +47,7 @@
 | Timestamp | Agent | Event |
 |-----------|-------|-------|
 | 2025-08-22T12:00:00Z | orchestrator | Created agent-ctx infrastructure + 4 branches |
-| 2026-08-22T10:30:00Z | training-recipe | Round 2 (fix agent): GS128 reverted to GS256 in palettize_core.py (commit `2ac6f9b`). Patch 1 ✅ kept (τ schedule verified correct). Patch 3 ✅ kept (adaptive ±5τ clamp). Patch 4 REVERTED (GS128 was NOT approved by orchestrator). PROGRESS.md reset to origin/main (prior agent had overwritten the Agent Status / Patch Status tables instead of appending). Branch to be rebased on latest main + pushed. |
+| 2026-08-22T10:30:00Z | training-recipe | Round 2 (fix agent): GS128 reverted to GS256 in palettize_core.py (commit `19597e5`). Patch 1 ✅ kept (τ schedule verified correct). Patch 3 ✅ kept (adaptive ±5τ clamp). Patch 4 REVERTED (GS128 was NOT approved by orchestrator). PROGRESS.md reset to origin/main (prior agent had overwritten the Agent Status / Patch Status tables instead of appending). Branch rebased on latest main + pushed. |
 
 ---
 
@@ -73,9 +73,9 @@
 
 | Patch | Round 1 status | Round 2 status | Notes |
 |------|----------------|----------------|-------|
-| 1 — Polynomial τ schedule (floor 0.5) | ✅ done (commit `012e820`) | ✅ kept — verified correct | Warmup 500@τ=2.0 + quadratic α=2 decay over 6000 steps to τ=0.5 + hold. CLI defaults (τ_init=2.0, τ_final=0.5, τ_anneal_steps=6000) verified. Stale function-signature defaults also fixed for consistency. |
-| 3 — Adaptive logit clamp ±5τ | ✅ done (commit `c0a80e4`) | ✅ kept — verified correct | `par.data.clamp_(-5.0 * tau, 5.0 * tau)` at train_qwen.py:~1192. Replaces prior fixed ±20 clamp. |
-| 4 — Group size 256→128 | ✅ done (commit `d72ba5e`) | ❌ **REVERTED** (commit `2ac6f9b`) | GS128 was NOT approved by the orchestrator. Reverted to GROUP_SIZE=256 — `scripts/palettize_core.py` is now byte-identical to `origin/main`. Existing GS=256 checkpoints remain valid (no re-calibration required). Patch 4b (per-tensor override) was already skipped in Round 1 — no override code to remove. |
+| 1 — Polynomial τ schedule (floor 0.5) | ✅ done (commit `becbcf4`) | ✅ kept — verified correct | Warmup 500@τ=2.0 + quadratic α=2 decay over 6000 steps to τ=0.5 + hold. CLI defaults (τ_init=2.0, τ_final=0.5, τ_anneal_steps=6000) verified. Stale function-signature defaults also fixed for consistency (Fix 3, commit `59e941e`). |
+| 3 — Adaptive logit clamp ±5τ | ✅ done (commit `d268618`) | ✅ kept — verified correct | `par.data.clamp_(-5.0 * tau, 5.0 * tau)` at train_qwen.py:~1192. Replaces prior fixed ±20 clamp. |
+| 4 — Group size 256→128 | ✅ done (commit `8277b69`) | ❌ **REVERTED** (commit `19597e5`) | GS128 was NOT approved by the orchestrator. Reverted to GROUP_SIZE=256 — `scripts/palettize_core.py` is now byte-identical to `origin/main`. Existing GS=256 checkpoints remain valid (no re-calibration required). Patch 4b (per-tensor override) was already skipped in Round 1 — no override code to remove. |
 
 **Other fixes applied in this round:**
 - PROGRESS.md reset to `origin/main` and only append-only entries added (this section + one Event Log row).
