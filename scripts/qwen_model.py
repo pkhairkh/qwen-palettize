@@ -431,6 +431,66 @@ def load_qwen_model(model_name="Qwen/Qwen3.5-4B", device="cuda", dtype=torch.bfl
     return model, tokenizer
 
 
+# ─── PartialModel / PartialWrapper (nn.Module subclasses) ────────────────
+# These were previously nested inside load_qwen_super_block_only as plain
+# Python classes with hand-rolled to/eval/train/parameters/named_parameters/
+# named_modules/get_submodule. Converting them to nn.Module unlocks
+# torch.compile, torch.utils.checkpoint, state_dict/load_state_dict, FSDP,
+# accelerate, transformers.Trainer, register_forward_hook, requires_grad_,
+# apply, and ~50 other nn.Module API methods. See research-architecture-
+# review/02_partial_wrapper_problem.md for the full diagnosis.
+class PartialModel(nn.Module):
+    """Prefix of Qwen3.5: embed_tokens + rotary_emb + first N layers + optional norm.
+
+    All attributes are registered as submodules / parameters / buffers via
+    nn.Module.__setattr__, so parameters(), named_modules(), state_dict(),
+    to(), eval(), train(), apply(), etc. are inherited and correct.
+    """
+    def __init__(self, embed_tokens, rotary_emb, layers, norm=None, config=None):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        # rotary_emb is an nn.Module in HF Qwen (Qwen3_5RotaryEmbedding);
+        # may be None for architectures that fold RoPE into the layer.
+        self.rotary_emb = rotary_emb
+        # nn.ModuleList (was: plain Python list) so layers are registered in
+        # _modules and participate in state_dict / to / eval / train / apply.
+        self.layers = nn.ModuleList(layers)
+        self.norm = norm
+        # config is plain metadata (not a tensor / module); keep as attribute.
+        self.config = config
+
+    def forward(self, input_ids, position_ids=None):
+        """Run embed_tokens → rotary_emb → prefix layers → optional norm.
+
+        Mirrors the forward path previously inlined in train_qwen.py's
+        training loop (teacher.model.embed_tokens → teacher.model.layers[i]
+        → ...). The loop there still calls layers directly for streaming /
+        CUDA-stream overlap reasons; this forward() is provided so that
+        standard PyTorch subsystems (torch.compile, checkpoint, Trainer,
+        hooks) work out of the box.
+        """
+        h = self.embed_tokens(input_ids)
+        if position_ids is None:
+            position_ids = torch.arange(
+                input_ids.shape[1], device=input_ids.device
+            ).unsqueeze(0)
+        pos_emb = (
+            self.rotary_emb(h, position_ids)
+            if self.rotary_emb is not None
+            else None
+        )
+        for layer in self.layers:
+            out = (
+                layer(h, position_embeddings=pos_emb)
+                if pos_emb is not None
+                else layer(h)
+            )
+            h = out[0] if isinstance(out, tuple) else out
+        if self.norm is not None:
+            h = self.norm(h)
+        return h
+
+
 def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
                                  device="cuda", dtype=torch.bfloat16):
     """Load embed_tokens + layers 0 to sb_end-1 using standard from_pretrained.
@@ -472,48 +532,10 @@ def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Build wrapper (same as before)
-    class PartialModel:
-        """Minimal model with embed_tokens + rotary_emb + prefix layers."""
-        def __init__(self, embed_tokens, rotary_emb, layers, norm=None, config=None):
-            self.embed_tokens = embed_tokens
-            self.rotary_emb = rotary_emb
-            self.layers = layers
-            self.norm = norm
-            self.config = config
-
-        def to(self, device):
-            self.embed_tokens = self.embed_tokens.to(device)
-            if self.rotary_emb is not None:
-                self.rotary_emb = self.rotary_emb.to(device)
-            self.layers = [l.to(device) for l in self.layers]
-            if self.norm is not None:
-                self.norm = self.norm.to(device)
-            return self
-
-        def eval(self):
-            self.embed_tokens.eval()
-            if self.rotary_emb is not None: self.rotary_emb.eval()
-            for l in self.layers: l.eval()
-            if self.norm is not None: self.norm.eval()
-            return self
-
-        def parameters(self):
-            for p in self.embed_tokens.parameters(): yield p
-            for l in self.layers:
-                for p in l.parameters(): yield p
-            if self.norm is not None:
-                for p in self.norm.parameters(): yield p
-
-        def named_modules(self):
-            yield ("embed_tokens", self.embed_tokens)
-            for i, layer in enumerate(self.layers):
-                for name, mod in layer.named_modules():
-                    if name:
-                        yield (f"layers.{i}.{name}", mod)
-                    else:
-                        yield (f"layers.{i}", layer)
-
+    # Build wrapper — PartialModel and PartialWrapper are now module-level
+    # nn.Module subclasses (see above). The hand-rolled to/eval/train/
+    # parameters/named_parameters/named_modules/get_submodule methods have
+    # been deleted; nn.Module provides all of them correctly.
     class PartialWrapper:
         def __init__(self, partial_model, config):
             self.model = partial_model
