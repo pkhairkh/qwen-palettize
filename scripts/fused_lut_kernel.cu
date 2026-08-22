@@ -1169,16 +1169,6 @@ void fused_lut_linear_fwdLauncher(
             reinterpret_cast<const __nv_bfloat16*>(bias),
             reinterpret_cast<__nv_bfloat16*>(y),
             M, K, N, group_size);
-    } else {
-        dim3 grid((M + FWD_BM - 1) / FWD_BM, (N + FWD_BN - 1) / FWD_BN);
-        dim3 block(FWD_TX, FWD_TY);   // (16, 16) = 256 threads
-        fused_lut_linear_fwd_kernel<<<grid, block, 0, 0>>>(
-            reinterpret_cast<const __nv_bfloat16*>(x),
-            reinterpret_cast<const __nv_bfloat16*>(palette),
-            indices,
-            reinterpret_cast<const __nv_bfloat16*>(bias),
-            reinterpret_cast<__nv_bfloat16*>(y),
-            M, K, N, group_size);
     }
 }
 
@@ -1191,15 +1181,6 @@ void fused_lut_linear_bwd_grad_xLauncher(
         dim3 grid((M + BWD_GX_TC_BM - 1) / BWD_GX_TC_BM, (K + BWD_GX_TC_BK - 1) / BWD_GX_TC_BK);
         dim3 block(BWD_GX_TC_THREADS);   // 256 threads
         fused_lut_linear_bwd_grad_x_tc_kernel<<<grid, block, 0, 0>>>(
-            reinterpret_cast<const __nv_bfloat16*>(grad_y),
-            reinterpret_cast<const __nv_bfloat16*>(palette),
-            indices,
-            reinterpret_cast<__nv_bfloat16*>(grad_x),
-            M, K, N, group_size);
-    } else {
-        dim3 grid((M + BWD_GX_BM - 1) / BWD_GX_BM, (K + BWD_GX_BK - 1) / BWD_GX_BK);
-        dim3 block(16, 16);
-        fused_lut_linear_bwd_grad_x_kernel<<<grid, block, 0, 0>>>(
             reinterpret_cast<const __nv_bfloat16*>(grad_y),
             reinterpret_cast<const __nv_bfloat16*>(palette),
             indices,

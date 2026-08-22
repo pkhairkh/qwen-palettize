@@ -699,7 +699,9 @@ def build_student_super_block(sb_idx, lora_rank=16, lora_alpha=32, use_soft_indi
         linears_to_palettize = []
         for name, module in layer.named_modules():
             if isinstance(module, nn.Linear):
-                full_name = f"model.layers.{layer_idx}.{name}.weight"
+                # Strip .base suffix if present (PalettizedLinear is wrapped as .base)
+                clean_name = name.replace(".base", "")
+                full_name = f"model.layers.{layer_idx}.{clean_name}.weight"
                 if should_palettize(full_name, module.weight):
                     linears_to_palettize.append((name, module, full_name))
         for name, module, full_name in linears_to_palettize:
@@ -758,7 +760,9 @@ def build_student_super_block(sb_idx, lora_rank=16, lora_alpha=32, use_soft_indi
                 # Look up the original pre-palettization weight for LoftQ SVD init.
                 # full_name format matches capture_original_weights_from_checkpoint keys:
                 #   "model.layers.{idx}.{submodule.path}.weight"
-                full_name = f"model.layers.{layer_idx}.{name}.weight"
+                # Strip .base suffix if present (PalettizedLinear is wrapped as .base)
+                clean_name = name.replace(".base", "")
+                full_name = f"model.layers.{layer_idx}.{clean_name}.weight"
                 orig_w = original_weights.get(full_name)
                 if orig_w is None:
                     # Should not happen — every palettized Linear has a corresponding
@@ -1163,12 +1167,14 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         # previous linear 2.0→0.1 schedule, and the indices stay trainable
         # for the entire 8300-step run instead of freezing at step 4000.
         if use_soft_indices:
+            # Relative to resume_step — fresh schedule for this run
+            rel_step = global_step - resume_step
             T_WARMUP = 500
             T_ANNEAL = tau_anneal_steps  # 6000 by default
-            if global_step < T_WARMUP:
+            if rel_step < T_WARMUP:
                 tau = tau_init  # 2.0 — warmup at high tau
-            elif global_step < T_WARMUP + T_ANNEAL:
-                progress = (global_step - T_WARMUP) / T_ANNEAL
+            elif rel_step < T_WARMUP + T_ANNEAL:
+                progress = (rel_step - T_WARMUP) / T_ANNEAL
                 # alpha=2 quadratic decay; max() floor at tau_final (0.5)
                 tau = max(tau_final, tau_init * (1.0 - progress) ** 2)
             else:

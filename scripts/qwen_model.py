@@ -214,7 +214,17 @@ class QwenLoRA(nn.Module):
                     W_pal = self._reconstruct_base_weight(base_module).float()
                 else:
                     W_pal = base_module.weight.data.float()
-                R = original_weight.float().to(W_pal.device) - W_pal
+                # R must be (out, in) to match nn.Linear convention for SVD:
+                #   U: (out, k), S: (k,), Vh: (k, in)
+                #   B_init = U[:, :rank]  → (out, rank) ✓
+                #   A_init = Vh[:rank, :].T → (in, rank) ✓
+                # For PalettizedLinear: W_pal is (in, out), so transpose to (out, in)
+                # For nn.Linear: weight is already (out, in)
+                if hasattr(base_module, 'palette'):
+                    W_pal_oi = W_pal.t()  # (in, out) → (out, in)
+                else:
+                    W_pal_oi = W_pal  # already (out, in)
+                R = original_weight.float().to(W_pal_oi.device) - W_pal_oi  # (out, in)
                 U, S, Vh = torch.linalg.svd(R.float(), full_matrices=False)
                 B_init = (U[:, :rank] * S[:rank].sqrt().unsqueeze(0)).contiguous()
                 A_init = (Vh[:rank, :].T * S[:rank].sqrt().unsqueeze(0)).contiguous()
