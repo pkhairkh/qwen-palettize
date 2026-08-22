@@ -11,7 +11,7 @@
 | nn-module-foundation | `agent/nn-module-foundation` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | training-recipe | `agent/training-recipe` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | kernels | `agent/kernels` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| optimizer-streams | `agent/optimizer-streams` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
+| optimizer-streams | `agent/optimizer-streams` | ✅ Done | ⬜ Pending | ⬜ Pending | ⬜ |
 
 **Legend:** ⬜ Pending | 🔄 In Progress | ✅ Done | ❌ Blocked
 
@@ -37,7 +37,7 @@
 | 4 | Group size 256→128 | training-recipe | ⬜ | — | — |
 | 5 | Fused bwd with AoS P layout | kernels | ⬜ | — | — |
 | 7 | Batched compute_P_W (25→1) | kernels | ⬜ | — | — |
-| 8 | Fused AdamW (bitsandbytes 8-bit) | optimizer-streams | ⬜ | — | — |
+| 8 | Fused AdamW (bitsandbytes 8-bit) | optimizer-streams | ✅ | agent/optimizer-streams | 8c72021 |
 | 6 | Stream double-buffering | optimizer-streams | ⬜ | — | — |
 
 ---
@@ -47,6 +47,7 @@
 | Timestamp | Agent | Event |
 |-----------|-------|-------|
 | 2025-08-22T12:00:00Z | orchestrator | Created agent-ctx infrastructure + 4 branches |
+| 2026-08-22T11:40:00Z | optimizer-streams | Wave 1 complete: Patch 8 (fused AdamW via bnb.optim.AdamW8bit) — 3 commits (8a 8b 8c) pushed to agent/optimizer-streams @8c72021. Wave 2 not yet started. |
 
 ---
 
