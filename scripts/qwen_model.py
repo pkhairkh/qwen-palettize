@@ -587,6 +587,75 @@ def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
     print(f"  Loaded prefix: {n_params:,} params ({n_layers_loaded} layers + embed_tokens)", flush=True)
     return wrapper, tokenizer
 
+
+def capture_original_weights_from_checkpoint(sb_idx, model_name="Qwen/Qwen3.5-4B",
+                                              device="cpu"):
+    """Load original fp16/bf16 weights from the HuggingFace checkpoint for the
+    given super-block's layers, BEFORE palettization replaces the nn.Linear
+    modules with PalettizedLinear. Used for LoftQ SVD initialization of LoRA
+    (QwenLoRA init="loftq" branch at qwen_model.py:209-222).
+
+    The QLoRA paper (Dettmers et al. 2023, §3.2 "LoftQ: LoRA-Fine-Tuning-aware
+    Quantization") initializes LoRA A and B from the SVD of the quantization
+    error: LoRA_A, LoRA_B = SVD(W_orig - W_quantized). This gives LoRA a
+    non-zero warm start that directly compensates the leading quantization
+    error directions, saving the first ~1000 steps of zero-init climbing.
+
+    Returns:
+        dict: {tensor_name: weight_tensor} where tensor_name is the full
+        parameter name (e.g. "model.layers.0.linear_attn.in_proj_qkv.weight")
+        and weight_tensor is the original fp32 weight on `device` (CPU by
+        default to save VRAM during build).
+
+    Memory:
+        Temporarily loads the full HF model (Qwen3.5-4B ~8 GB on disk,
+        ~16 GB in bf16 VRAM if device='cuda', ~8 GB RAM if device='cpu').
+        The full model is deleted + gc'd before returning, so only the
+        captured super-block weights (~1-2 GB for 4 layers) remain.
+
+    Args:
+        sb_idx: super-block index (0-7). Captures layers SUPER_BLOCKS[sb_idx].
+        model_name: HF model id (default "Qwen/Qwen3.5-4B").
+        device: where to place the captured weights ("cpu" saves VRAM;
+            QwenLoRA will .to(W_pal.device) them as needed during SVD init).
+    """
+    from transformers import AutoModelForCausalLM
+    import gc
+
+    sb_start, sb_end = SUPER_BLOCKS[sb_idx]
+    print(f"Capturing original weights for super-block {sb_idx} "
+          f"(layers {sb_start}-{sb_end-1}) from {model_name}...", flush=True)
+
+    # Load full model on CPU with low_mem to avoid OOM during build.
+    # dtype=bfloat16 matches the training dtype (DTYPE in train_qwen.py).
+    # The SVD in QwenLoRA will upcast to fp32 internally.
+    full_model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=torch.bfloat16, low_cpu_mem_usage=True,
+    )
+
+    weights = {}
+    for layer_idx in range(sb_start, sb_end):
+        layer = full_model.model.layers[layer_idx]
+        for name, param in layer.named_parameters():
+            if name.endswith(".weight"):
+                # Full HF parameter name: model.layers.{idx}.{submodule.path}.weight
+                # Matches the full_name format used in build_student_super_block
+                # (train_qwen.py:681: full_name = f"model.layers.{layer_idx}.{name}.weight")
+                full_name = f"model.layers.{layer_idx}.{name}"
+                weights[full_name] = param.data.clone().to(device)
+
+    # Free the full model — we only need the captured super-block weights.
+    del full_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    total_params = sum(t.numel() for t in weights.values())
+    print(f"  Captured {len(weights)} weight tensors ({total_params:,} params) "
+          f"on {device}", flush=True)
+    return weights
+
+
 def palettize_linear(linear_module, tensor_name, palettized_dir, device="cuda",
                      use_soft_indices=False):
     """Replace an nn.Linear with a PalettizedLinear using saved 2-bit data.
