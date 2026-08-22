@@ -4,16 +4,13 @@
 
 ## Folder: `research-filter-consolidation/`
 
-| File | Wave | Description |
-|------|------|-------------|
-| [`00_audit_table.md`](00_audit_table.md) | 1 | Classification of ALL 201 recommendations from 6 agents (101 KEEP, 99 REJECT) |
-| [`01_training_recipe.md`](01_training_recipe.md) | 2 | Patches 1-4: τ schedule, LoftQ init, logit clamp, group size |
-| [`02_kernel_efficiency.md`](02_kernel_efficiency.md) | 2 | Patches 5-7: fused bwd AoS, stream double-buffer, batched compute_P_W |
-| [`03_optimizer_speedup.md`](03_optimizer_speedup.md) | 2 | Patches 8-9: fused AdamW, PartialWrapper→nn.Module |
-| [`04_rejected_sidesteps.md`](04_rejected_sidesteps.md) | 3 | 65 rejected recommendations grouped by category |
-| [`05_special_notes.md`](05_special_notes.md) | 3 | Critical context (1d-kmeans best, Lloyd-Max bullshit, server offline, ambiguities) |
-| [`06_ENHANCEMENT_ROADMAP.md`](06_ENHANCEMENT_ROADMAP.md) | 4 | **Master document** — 9 patches with dependencies, testing plan, risks |
-| [`07_INDEX.md`](07_INDEX.md) | 4 | This file |
+| File | Description |
+|------|-------------|
+| [`01_training_recipe.md`](01_training_recipe.md) | Patches 1-4: τ schedule, LoftQ init, logit clamp, group size |
+| [`02_kernel_efficiency.md`](02_kernel_efficiency.md) | Patches 5-7: fused bwd AoS, stream double-buffer, batched compute_P_W |
+| [`03_optimizer_speedup.md`](03_optimizer_speedup.md) | Patches 8-9: fused AdamW, PartialWrapper→nn.Module |
+| [`06_ENHANCEMENT_ROADMAP.md`](06_ENHANCEMENT_ROADMAP.md) | **Master document** — 9 patches with dependencies, testing plan, risks |
+| [`07_INDEX.md`](07_INDEX.md) | This file |
 
 ## Patch Status
 
@@ -34,10 +31,8 @@
 ## How to Use This Folder
 
 1. **Read `06_ENHANCEMENT_ROADMAP.md` first** — it's the master document
-2. **Read `05_special_notes.md`** before implementing — critical context
-3. **For each patch**, read the detail in `01`/`02`/`03` files
-4. **Check `04_rejected_sidesteps.md`** if unsure whether something is a sidestep
-5. **Refer to `00_audit_table.md`** for the full classification of all 201 recommendations
+2. **For each patch**, read the detail in `01`/`02`/`03` files
+3. **Refer to original research** in `research-kernel-accuracy/`, `research-kernel-efficiency/`, `research-indices-training/`, `research-palettes-training/`, `research-architecture-review/`, `research-literature-review/` for deeper analysis
 
 ## Recommended Implementation Order
 

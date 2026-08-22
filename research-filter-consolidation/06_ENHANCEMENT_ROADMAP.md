@@ -197,17 +197,9 @@ Patch 8 (fused AdamW) ──→ LAST (after nn.Module, needs bitsandbytes)
 
 ---
 
-## 8. What This Roadmap Does NOT Include
+## 8. Notes
 
-See `04_rejected_sidesteps.md` for the full list of 65 rejected recommendations. Key categories:
-
-- ❌ GPTQ / AWQ / QuIP / SqueezeLLM calibration (replace 1d-kmeans)
-- ❌ LLT deterministic softmax / LUT-Q k-means re-quantization (replace Gumbel-Softmax)
-- ❌ VQ / additive codebook / lattice (replace scalar LUT)
-- ❌ Modular package rewrite / Config dataclass / HF Trainer (architecture change)
-- ❌ wandb / tensorboard / pytest / CI-CD (tooling, out of scope)
-- ❌ tcgen05 / WGMMA / TMA (radical kernel rewrite — keep mma.sync.m16n8k16)
-- ❌ From-scratch training / BitNet (replaces k-means init)
-- ❌ Lloyd-Max / Hessian-weighted k-means (already tested as BULLSHIT)
-
-**These will NOT be implemented.** They are documented for reference only.
+- **Training server is OFFLINE** — all patches are research-only. Do not run training until server is back.
+- **1d-kmeans is our calibration** — already tested as best non-GPTQ approach. Patches enhance it (group size tuning), not replace it.
+- **PartialWrapper→nn.Module (Patch 9)** is a speed enhancement that unlocks torch.compile and gradient checkpointing. It does NOT change the training approach.
+- See original research folders (`research-kernel-accuracy/`, `research-kernel-efficiency/`, etc.) for deeper analysis of each patch.
