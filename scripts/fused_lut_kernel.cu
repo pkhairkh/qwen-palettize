@@ -1158,13 +1158,8 @@ void fused_lut_linear_fwdLauncher(
     const c10::BFloat16* bias, c10::BFloat16* y,
     int M, int K, int N, int group_size
 ) {
-    // Phase V: pick TC variant if USE_TC_FWD env var is set
-    static int use_tc = -1;
-    if (use_tc == -1) {
-        const char* env = getenv("USE_TC_FWD");
-        use_tc = (env && atoi(env) == 1) ? 1 : 0;
-    }
-    if (use_tc) {
+    // Always use Tensor Core path (Patch: removed USE_TC_FWD env var)
+    {
         dim3 grid((M + FWD_TC_BM - 1) / FWD_TC_BM, (N + FWD_TC_BN - 1) / FWD_TC_BN);
         dim3 block(FWD_TC_THREADS);   // 256 threads (1D for simpler warp mapping)
         fused_lut_linear_fwd_tc_kernel<<<grid, block, 0, 0>>>(
@@ -1191,13 +1186,8 @@ void fused_lut_linear_bwd_grad_xLauncher(
     const c10::BFloat16* grad_y, const c10::BFloat16* palette, const uint8_t* indices,
     c10::BFloat16* grad_x, int M, int K, int N, int group_size
 ) {
-    // Phase VI: pick TC variant if USE_TC_BWD_GX env var is set
-    static int use_tc = -1;
-    if (use_tc == -1) {
-        const char* env = getenv("USE_TC_BWD_GX");
-        use_tc = (env && atoi(env) == 1) ? 1 : 0;
-    }
-    if (use_tc) {
+    // Always use Tensor Core path (Patch: removed USE_TC_BWD_GX env var)
+    {
         dim3 grid((M + BWD_GX_TC_BM - 1) / BWD_GX_TC_BM, (K + BWD_GX_TC_BK - 1) / BWD_GX_TC_BK);
         dim3 block(BWD_GX_TC_THREADS);   // 256 threads
         fused_lut_linear_bwd_grad_x_tc_kernel<<<grid, block, 0, 0>>>(
