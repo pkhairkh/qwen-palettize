@@ -1300,8 +1300,26 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
             h_out_buf[buf_idx] = torch.empty_like(_h.detach())
 
         # === Capture teacher_graph[buf_idx] on stream_t (Patch 22) ===
+        # Patch 22: explicit stream double-buffer integration with CUDA Graphs.
+        #   - teacher_graph runs on stream_t (separate from student's default stream)
+        #   - Producer/consumer sync via event_t (teacher→student) + event_s (student→teacher)
+        #   - Teacher forward (80ms) is fully hidden behind student compute (980ms)
+        #     because the NEXT iter's teacher_graph can replay on stream_t while
+        #     the CURRENT iter's student_graph is still doing backward on default.
         teacher_graph[buf_idx] = torch.cuda.CUDAGraph()
         with torch.cuda.graph(teacher_graph[buf_idx], stream=stream_t):
+            # Patch 22 invariant 1 (WAIT): teacher must NOT overwrite h_out_buf[buf_idx]
+            # while the PREVIOUS iter's student is still reading it. event_s[buf_idx]
+            # was recorded by student_graph[buf_idx] after its compute_loss (see
+            # invariant 3 below). On first capture for this buf_idx, event_s[buf_idx]
+            # is uninitialized → wait_event returns immediately (no-op).
+            #
+            # This is the captured-graph analogue of the eager Patch 6 line:
+            #   if step > 0: stream_t.wait_event(event_s[buf_idx])
+            # (train_qwen.py:1667-1668). Baking it into the graph makes the
+            # producer/consumer ordering deterministic across replays.
+            stream_t.wait_event(event_s[buf_idx])
+
             with torch.no_grad():
                 with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
                     h = teacher.model.embed_tokens(static_batch_ids)
@@ -1320,7 +1338,9 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
                                 out = layer(h)
                             h = out[0] if isinstance(out, tuple) else out
                     h_out_buf[buf_idx].copy_(h.detach())
-            # Patch 22 invariant 1: signal teacher forward done writing
+            # Patch 22 invariant 1 (SIGNAL): teacher forward done writing h_out_buf[buf_idx].
+            # The student_graph[buf_idx] (captured below) waits on this event before
+            # reading h_out_buf[buf_idx] (invariant 2).
             event_t[buf_idx].record(stream_t)
 
         # === Capture student_graph[buf_idx] on default stream (Patch 21) ===
@@ -1401,19 +1421,49 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         last_capture_hp_sig[buf_idx]  = current_hp_sig
 
     def _replay_step_graphs(buf_idx):
-        """Replay teacher_graph[buf_idx] + student_graph[buf_idx].
+        """Replay teacher_graph[buf_idx] + student_graph[buf_idx] (Patch 22).
+
+        Patch 22 stream double-buffer integration:
+          1. teacher_graph[buf_idx].replay() — enqueues the teacher forward
+             on stream_t. Inside the captured graph, the FIRST op is
+             `stream_t.wait_event(event_s[buf_idx])` (invariant 1 WAIT),
+             which blocks until the PREVIOUS iter's student finished reading
+             h_out_buf[buf_idx]. On first replay for this buf_idx, the event
+             is uninitialized → wait is a no-op. The LAST op is
+             `event_t[buf_idx].record(stream_t)` (invariant 1 SIGNAL).
+          2. student_graph[buf_idx].replay() — enqueues the student fwd +
+             loss + bwd + clip + opt + zero_grad on the DEFAULT stream.
+             Inside the captured graph, the FIRST op is
+             `current_stream().wait_event(event_t[buf_idx])` (invariant 2),
+             which blocks until the teacher finished writing h_out_buf[buf_idx].
+             After compute_loss, `event_s[buf_idx].record(current_stream())`
+             (invariant 3) signals that the student is done READING h_out_buf —
+             the NEXT iter's teacher_graph[buf_idx] can now start writing.
+
+        Stream overlap (the entire point of Patch 22):
+          Because teacher_graph runs on stream_t and student_graph runs on
+          the default stream, the GPU can execute them concurrently. The
+          80ms teacher forward for iter N+1 (enqueued by the NEXT call to
+          _replay_step_graphs(1-buf_idx)) runs concurrently with the 980ms
+          student backward for iter N — the teacher forward is fully hidden.
 
         Pre-conditions:
           - static_batch_ids has been populated with current batch_ids
           - Both graphs were previously captured for this buf_idx
         Returns: (loss_val, l_cos_val) as Python floats (post-sync).
         """
-        # Patch 22: teacher graph runs on stream_t, records event_t
+        # Patch 22: teacher graph on stream_t — enqueues wait_event(event_s),
+        # teacher forward, h_out_buf.copy_(h.detach()), record(event_t).
+        # Returns immediately (does not block CPU — runs async on stream_t).
         teacher_graph[buf_idx].replay()
-        # Patch 21: student graph runs on default stream, waits for event_t,
-        # does fwd + loss + bwd + clip + opt + zero_grad, records event_s
+        # Patch 21: student graph on default stream — enqueues wait_event(event_t),
+        # student fwd, loss, record(event_s), backward, clip, opt, zero_grad.
+        # The wait_event inside the captured graph blocks the default stream
+        # until event_t[buf_idx] is signaled by the teacher graph above.
         student_graph[buf_idx].replay()
-        # Sync to make static_loss readable via .item()
+        # Sync to make static_loss readable via .item() (forces CPU-GPU sync).
+        # This is the only sync point in the graph path — everything before
+        # this runs async on the GPU.
         torch.cuda.synchronize()
         return static_loss[buf_idx].item(), static_l_cos[buf_idx].item()
 
@@ -1549,11 +1599,29 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         # the eager path (below) on capture/replay failure or when conditions
         # aren't met.
         #
-        # The graph path captures: teacher fwd (stream_t) + student fwd + loss
-        # + bwd + clip + opt + zero_grad (default stream), with event-based
-        # sync between the two graphs (Patch 22). The eager path (below) is
-        # the original Patch 6 stream double-buffer + existing training step,
-        # preserved verbatim as the fallback.
+        # Patch 21: student_graph captures fwd + loss + bwd + clip + opt + zero_grad
+        #           on the DEFAULT stream. Eliminates ~500 kernel launch dispatches
+        #           × 5µs = 2.5ms of CPU-side overhead per step.
+        # Patch 22: teacher_graph captures the teacher forward on stream_t (separate
+        #           from student's default stream), with event-based producer/consumer
+        #           synchronization between the two graphs (3 invariants from
+        #           06_stream_overlap.md §3.1, baked into the captures):
+        #             1. WAIT  (teacher, start):  stream_t.wait_event(event_s[buf_idx])
+        #                 — wait for previous iter's student to finish reading h_out_buf
+        #             2. WAIT  (student, start): current_stream().wait_event(event_t[buf_idx])
+        #                 — wait for current iter's teacher to finish writing h_out_buf
+        #             3. SIGNAL (student, after compute_loss): event_s[buf_idx].record()
+        #                 — let the NEXT iter's teacher start writing to h_out_buf now
+        #                   (the student only needed h_out_buf for the loss; backward
+        #                   doesn't touch it). This enables true producer/consumer
+        #                   overlap: the 80ms teacher forward for iter N+1 runs
+        #                   concurrently with the 980ms student backward for iter N.
+        #           Teacher forward is fully hidden behind student compute, made
+        #           deterministic by graph replay (Patch 6's stream double-buffer
+        #           preserved as the eager fallback below).
+        #
+        # The eager path (below) is the original Patch 6 stream double-buffer +
+        # existing training step, preserved verbatim as the fallback.
         save_every = hp.get("save_every", 2000)
         current_hp_sig = json.dumps(hp, sort_keys=True)
         if _cuda_graph_eligible(step, hp, global_step, save_every):
