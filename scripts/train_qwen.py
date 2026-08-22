@@ -591,10 +591,17 @@ def build_optimizers(model, hp, sb_idx):
     # FP32 master optimizers for palettes, LoRA, layernorms, Muon params
     opt_muon = FP32MasterMuon(muon_groups, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0) if muon_groups else None
     opt_adamw = FP32MasterAdamW(adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0) if adamw_groups else None
-    # AdamW with fp32 master for index_logits (Blackwell 96GB can afford 21.4 GB).
-    # CRITICAL: fp16 AdamW state + eps=1e-8 → NaN (sqrt(v)+eps underflows to 0 in fp16).
-    # FP32 master avoids this. Plain SGD (L4 fallback) was too weak for Gumbel-Softmax grads.
-    opt_indices = FP32MasterAdamW(plain_adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0) if plain_adamw_groups else None
+    # index_logits optimizer: bitsandbytes AdamW8bit (Patch 8, Wave 1).
+    # Replaces FP32MasterAdamW (113 ms/step, 21.4 GB VRAM) with bnb.optim.AdamW8bit
+    # (~20 ms/step, 3.56 GB VRAM). 8-bit state (m, v) handles fp16 index_logits
+    # natively — no fp32 master copy needed. eps=1e-8 chosen to match the previous
+    # setup; if fp16 Gumbel-Softmax grads underflow to NaN, raise to 1e-6 (Wave 3).
+    # See research-filter-consolidation/03_optimizer_speedup.md §Patch 8 (Option B),
+    # docs/papers/1412.6980_Adam_Kingma2015.pdf + 1711.05101_AdamW_Loshchilov2019.pdf.
+    import bitsandbytes as bnb
+    opt_indices = bnb.optim.AdamW8bit(
+        plain_adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0
+    ) if plain_adamw_groups else None
 
     # Per-group counts for visibility
     muon_by = {}
