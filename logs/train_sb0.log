@@ -2,7 +2,7 @@
 
 ======================================================================
 === Training super-block 0 (soft_indices=True) ===
-  max_steps: 12000  lora_rank: 16
+  max_steps: 8300  lora_rank: 16
   seq_len: 512  batch_size: 32
   tokens/step: 16384
   tau: 2.0 → 0.1 over 4000 steps
@@ -15,11 +15,11 @@ Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF
 Downloading bytes:           |  0.00B            
 Reconstructing (incomplete total...): |          |  0.00B /  0.00B            [A
 
-Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s][A[AFetching 2 files: 100%|##########| 2/2 [00:00<00:00, 1445.56it/s]
+Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s][A[AFetching 2 files: 100%|##########| 2/2 [00:00<00:00, 1551.15it/s]
 Download complete: :           |  0.00B            
 Reconstruction complete: |          |  0.00B /  0.00B                         [ADownload complete: :           |  0.00B            
 Reconstruction complete: |          |  0.00B /  0.00B            
-Loading weights:   0%|          | 0/426 [00:00<?, ?it/s]Loading weights: 100%|##########| 426/426 [00:00<00:00, 14763.43it/s]
+Loading weights:   0%|          | 0/426 [00:00<?, ?it/s]Loading weights: 100%|##########| 426/426 [00:00<00:00, 15512.34it/s]
   Loaded prefix: 1,081,957,952 params (4 layers + embed_tokens)
   Palettized 25 Linears to 2-bit (soft_indices=True)
   Attached LoRA (rank-16 + rank-32 on 5 worst-cos) to 31 Linears across 4 layers
@@ -48,34 +48,10 @@ Loading prefix: layers 0-3 (4 layers)...
 Downloading bytes:           |  0.00B            
 Reconstructing (incomplete total...): |          |  0.00B /  0.00B            [A
 
-Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s][A[AFetching 2 files: 100%|##########| 2/2 [00:00<00:00, 1867.87it/s]
+Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s][A[AFetching 2 files: 100%|##########| 2/2 [00:00<00:00, 1887.63it/s]
 Download complete: :           |  0.00B            
 Reconstruction complete: |          |  0.00B /  0.00B                         [A
 
-Loading weights:   0%|          | 0/426 [00:00<?, ?it/s][A[ALoading weights: 100%|##########| 426/426 [00:00<00:00, 14222.85it/s]
+Loading weights:   0%|          | 0/426 [00:00<?, ?it/s][A[ALoading weights: 100%|##########| 426/426 [00:00<00:00, 14025.13it/s]
 Download complete: :           |  0.00B            
 Reconstruction complete: |          |  0.00B /  0.00B            
-  Loaded prefix: 1,081,957,952 params (4 layers + embed_tokens)
-
-=== Training ===
-  Loss: 1-cos+norm_mse  weights: {'cos': 0.5, 'mse': 0.5}
-  LRs: {'palettes': 0.003, 'lora': 0.001, 'indices': 0.01, 'layernorms': 0.0003}
-  Groups: {'palettes': True, 'lora': True, 'indices': True, 'layernorms': True}
-  Resumed best: step=8000 cos=0.946436 (saves will only trigger if beaten)
-
-=== Preparing eval set ===
-  Loaded eval set: torch.Size([256, 512]) from /root/qwen35_palettize/eval_tokens.pt
-Resolving data files:   0%|          | 0/2410 [00:00<?, ?it/s]Resolving data files: 100%|##########| 2410/2410 [00:00<00:00, 64021.79it/s]
-[fused_lut_linear_cuda] Compiling (may take ~30s on first run)...
-  arches: compute_120,code=sm_120;compute_89,code=sm_89;compute_86,code=sm_86;compute_80,code=sm_80;compute_90,code=sm_90
-  cuda flags: -O3 -std=c++17 --use_fast_math -DCUDA_HAS_BF16 -D__CUDA_NO_HALF_OPERATORS__ -gencode=arch=compute_120,code=sm_120 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90
-  step= 8050 loss=0.0839 cos=0.9463 tps=0.8 tau=0.100 GPU[36.1/92.3G util=99%] gn=[indices=0.06 palettes+lora+norms=4.56] [indices=2.5e-03 layernorms=7.4e-05 lora=2.5e-04 palettes=7.4e-04]
-  step= 8100 loss=0.0846 cos=0.9454 tps=0.8 tau=0.100 GPU[36.1/92.3G util=99%] gn=[indices=0.06 palettes+lora+norms=6.09] [indices=2.4e-03 layernorms=7.3e-05 lora=2.4e-04 palettes=7.3e-04]
-  step= 8150 loss=0.0747 cos=0.9527 tps=0.8 tau=0.100 GPU[36.1/92.3G util=99%] gn=[indices=0.06 palettes+lora+norms=2.39] [indices=2.4e-03 layernorms=7.1e-05 lora=2.4e-04 palettes=7.1e-04]
-  step= 8200 loss=0.0837 cos=0.9462 tps=0.8 tau=0.100 GPU[36.1/92.3G util=100%] gn=[indices=0.06 palettes+lora+norms=2.67] [indices=2.3e-03 layernorms=6.9e-05 lora=2.3e-04 palettes=6.9e-04]
-  step= 8250 loss=0.0847 cos=0.9459 tps=0.8 tau=0.100 GPU[36.1/92.3G util=99%] gn=[indices=0.06 palettes+lora+norms=2.17] [indices=2.3e-03 layernorms=6.8e-05 lora=2.3e-04 palettes=6.8e-04]
-  [EVAL] step=8250 cos=0.949274 loss=0.079734 (256 held-out seqs)
-  ★ NEW BEST (eval): step=8250 cos=0.949274
-    (deferred save — next save at step 9000)
-  step= 8300 loss=0.0830 cos=0.9474 tps=0.8 tau=0.100 GPU[36.1/92.3G util=99%] gn=[indices=0.06 palettes+lora+norms=1.93] [indices=2.2e-03 layernorms=6.6e-05 lora=2.2e-04 palettes=6.6e-04]
-  step= 8350 loss=0.0747 cos=0.9530 tps=0.8 tau=0.100 GPU[36.1/92.3G util=99%] gn=[indices=0.06 palettes+lora+norms=1.20] [indices=2.1e-03 layernorms=6.4e-05 lora=2.1e-04 palettes=6.4e-04]
