@@ -13,7 +13,7 @@
 | layer-fusion | `agent/layer-fusion` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | lora-fusion | `agent/lora-fusion` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | cuda-graphs | `agent/cuda-graphs` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| quality-recipe | `agent/quality-recipe` | ✅ Done | 🔄 In Progress | ⬜ Pending | ⬜ Pending | ⬜ |
+| quality-recipe | `agent/quality-recipe` | ✅ Done | 🔄 Coord Sent | ⬜ Pending | ⬜ Pending | ⬜ |
 
 **Legend:** ⬜ Pending | 🔄 In Progress | ✅ Done | ❌ Blocked
 
@@ -50,7 +50,7 @@
 | 23 | Loss config switch (1-cos+norm_mse, 80/20) | quality-recipe | ✅ | `agent/quality-recipe` | `d00e7f6` |
 | 24 | Per-group gradient clipping | quality-recipe | ✅ | `agent/quality-recipe` | `b5828a4` |
 | 25 | LUT-Q re-quantization (step 2000, 4000) | quality-recipe | ⬜ | — | — |
-| 26 | Deterministic-ST (remove Gumbel noise) | quality-recipe | 🔄 | `agent/quality-recipe` | (pending coordination w/ triton-kernels) |
+| 26 | Deterministic-ST (remove Gumbel noise) | quality-recipe | 🔄 (coord sent) | `agent/quality-recipe` | inbox msg → triton-kernels 2026-08-23T02:00:00Z; awaiting kernel-side change |
 
 ---
 
@@ -60,6 +60,7 @@
 |-----------|-------|-------|
 | 2026-08-23T00:00:00Z | orchestrator | Created Round 3 multi-agent infrastructure for full Triton fusion. 6 agents, 17 patches (P10-P26), 4 waves. Previous Round 1/2 patches (P1-P9) already merged to main. Current state: tps=0.6, backward=682ms (73% autograd overhead). Target: tps>3, backward<100ms. All work OFFLINE (no server). |
 | 2026-08-23T01:30:00Z | quality-recipe | Wave 1 complete: Patch 23 (loss config 1-cos+norm_mse cos=0.8 mse=0.2, commit d00e7f6) + Patch 24 (per-group clip indices=1.0 others=0.3, commit b5828a4 — comment update only; functional code already in place from prior round commit 5446edf). τ schedule (lines 1176-1192) verified to already match recommended warmup+quadratic decay+hold pattern from research-indices-training/07_recommendations.md Fix 1 — no action needed. Branch pushed. Wave 2 (Patch 26 deterministic-ST) pending: requires inbox coordination with triton-kernels to remove Gumbel noise from compute_P_W_ste_kernel in triton_soft_forward.py. |
+| 2026-08-23T02:00:00Z | quality-recipe | Wave 2 Patch 26 coordination: sent inbox message to triton-kernels requesting removal of Gumbel noise from compute_P_W_ste_kernel in triton_soft_forward.py (6 specific changes listed: remove 4 Gumbel noise lines, remove step_seed from kernel sig + Python launcher, remove _gumbel_sample function, remove _next_soft_step_seed + _SOFT_STEP_SEED, update TritonSoftLinear.forward docstring). Verified train_qwen.py has NO step_seed references — no changes needed on my side (qwen_model.py already calls triton_soft_linear without step_seed; public API has never exposed it). Also flagged that triton-kernels' Patch 15 (batched compute_P_W) plan in their TASKS.md mentions base_seed for Gumbel decorrelation — needs to be dropped since there's no Gumbel anymore. Test files needing updates (test_triton_soft_forward.py, test_triton_soft_backward.py, bench_triton_kernels.py, test_batched_compute_pw.py, test_profile_kernels.py) listed for triton-kernels. Awaiting their confirmation reply in quality-recipe inbox. |
 
 ---
 
@@ -68,8 +69,8 @@
 | Agent | Last Message | From | Subject | Action Required |
 |-------|--------------|------|---------|-----------------|
 | nn-module-foundation | — | — | — | — |
-| triton-kernels | — | — | — | — |
+| triton-kernels | 2026-08-23T02:00:00Z | quality-recipe | Patch 26 deterministic-ST: remove Gumbel noise from compute_P_W_ste_kernel | Apply 6 changes to triton_soft_forward.py + update test files; reply in quality-recipe inbox when done |
 | layer-fusion | — | — | — | — |
 | lora-fusion | — | — | — | — |
 | cuda-graphs | — | — | — | — |
-| quality-recipe | 2026-08-23T01:30:00Z | orchestrator (startup) | Round 3 infrastructure ready — quality patches span Waves 1-3 | Wave 1 complete; Wave 2 starting (Patch 26 coordination w/ triton-kernels) |
+| quality-recipe | 2026-08-23T01:30:00Z | orchestrator (startup) | Round 3 infrastructure ready — quality patches span Waves 1-3 | Wave 1 complete; Wave 2 in progress (Patch 26 coordination sent to triton-kernels); Wave 3 next |

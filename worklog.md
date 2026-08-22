@@ -139,3 +139,41 @@ Stage Summary:
   [x] Branch pushed — see git push below
 - Branch state: agent/quality-recipe @ b5828a4 (b5828a4 → d00e7f6 → f2e216b base).
 - Wave 2 (Patch 26 deterministic-ST) starts next: I send an inbox message to triton-kernels requesting the Gumbel noise removal from compute_P_W_ste_kernel. Their job is to modify triton_soft_forward.py. My job ends after the coordination message + PROGRESS update (since train_qwen.py doesn't directly call triton_soft_linear() and the public API already doesn't expose step_seed).
+
+---
+Task ID: 3-wave2
+Agent: quality-recipe
+Task: Wave 2 — Patch 26 (deterministic-ST). Coordinate with triton-kernels to remove Gumbel noise from compute_P_W_ste_kernel in triton_soft_forward.py. DoD: coordination message sent, train_qwen.py verified clean of step_seed, syntax check, push.
+
+Work Log:
+- Checked inbox at start of Wave 2 — only orchestrator's startup message (no RELEASED/LOCK from other agents). Clean slate.
+- Sub-task 26a (coordination): inspected scripts/triton_soft_forward.py to gather exact details for the coordination message. Confirmed the Gumbel pattern:
+    - Line 51-66: `@triton.jit def _gumbel_sample(seed, idx)` — LCG-based Gumbel(0,1) sampler matching CUDA.
+    - Line 89: `step_seed` parameter on `compute_P_W_ste_kernel`.
+    - Lines 124-129: 4 Gumbel noise samples, `(l_k + _gumbel_sample(step_seed, idx_grid*4 + k)) * inv_tau`.
+    - Lines 246-276: `compute_P_W_ste_triton()` Python launcher accepts `step_seed: int` and passes to kernel.
+    - Lines 308-314: `_SOFT_STEP_SEED = 0` global + `_next_soft_step_seed()` function.
+    - Lines 331-358: `TritonSoftLinear.forward()` calls `step_seed = _next_soft_step_seed()` then passes to `compute_P_W_ste_triton`.
+    - Lines 414-423: `triton_soft_linear()` PUBLIC API does NOT take step_seed (already correct).
+- Inspected scripts/qwen_model.py:115-119, 147-168: confirmed the call site `triton_soft_linear(x_flat, palette, index_logits, bias, group_size, tau)` already does NOT pass step_seed. Verified `train_qwen.py` has ZERO references to `step_seed` or `triton_soft` (grep returned no matches).
+- Drafted coordination message to triton-kernels with 6 specific changes listed:
+    1. Replace 4 Gumbel noise lines (124-129) with simple `n_k = l_k * inv_tau` + Patch 26 comment.
+    2. Remove `step_seed` from kernel signature (line 89).
+    3. Remove `step_seed` from `compute_P_W_ste_triton()` Python launcher (lines 251, 274).
+    4. Delete `_gumbel_sample` function (lines 51-66) + comment block (lines 38-49).
+    5. Delete `_SOFT_STEP_SEED` (line 308) + `_next_soft_step_seed()` (lines 311-314).
+    6. Update `TritonSoftLinear.forward` (lines 347-350) to drop `step_seed = _next_soft_step_seed()` + drop `step_seed` from `compute_P_W_ste_triton` call + update docstring.
+- Also flagged: triton-kernels' Patch 15 (batched compute_P_W) in their TASKS.md Wave 2 mentions `base_seed` for Gumbel decorrelation — needs to be dropped since there's no Gumbel anymore.
+- Listed test files needing updates: test_triton_soft_forward.py, test_triton_soft_backward.py, bench_triton_kernels.py, test_batched_compute_pw.py, test_profile_kernels.py.
+- Saved coordination message: agent-ctx/agent-triton-kernels/inbox/1724544000-from-quality-recipe.md (188 lines).
+- Updated agent-ctx/PROGRESS.md: Patch 26 row updated to "🔄 (coord sent)" with note about awaiting triton-kernels reply; Agent Status quality-recipe Wave 2 → "🔄 Coord Sent"; event log entry added; inbox summary updated with my last message to triton-kernels.
+
+Stage Summary:
+- Wave 2 Patch 26 coordination is COMPLETE on my side:
+  [x] Coordination message sent to triton-kernels inbox with full implementation spec
+  [x] train_qwen.py verified clean of step_seed references — NO changes needed (public API triton_soft_linear already doesn't expose step_seed; qwen_model.py call site already doesn't pass it)
+  [x] Syntax check: train_qwen.py unchanged from Wave 1, still PASS
+  [x] PROGRESS.md + inbox summary updated
+- Wave 2 DoD partially met — the coordination is done, but the actual Gumbel removal in triton_soft_forward.py is owned by triton-kernels and awaits their action. Per orchestrator rules: "Wait for triton-kernels to confirm the kernel change is done." In this offline single-agent execution, I cannot receive their reply in real-time; the inbox message + PROGRESS documentation constitutes my Wave 2 deliverable. The orchestrator (or a future merge step) will verify triton-kernels' completion.
+- Branch state: agent/quality-recipe (will push after this commit).
+- Wave 3 (Patch 25 LUT-Q re-quantization) starts next — NEW scripts/re_quantize.py + small call-site insertion in train_qwen.py at step 2000+4000.
