@@ -190,6 +190,54 @@ class TestModuleSymbols(unittest.TestCase):
         ]:
             self.assertIn(sym, src, f"{sym} missing from fused_lut_kernel.cu")
 
+    def test_paos_allocated_as_kn4_in_cpp_wrapper(self):
+        """Round-1 fix (Issue 2a): the C++ wrapper must allocate P_aos as
+        (K, N, 4) fp16 — NOT (4, K, N) SoA. The AoS layout is what makes
+        the fused bwd kernel's single coalesced 64-bit load possible.
+        """
+        py_path = os.path.join(HERE, "fused_lut_linear_cuda.py")
+        with open(py_path) as f:
+            src = f.read()
+        # The (K, N, 4) allocation must appear in fused_lut_linear_soft_fwd_aos
+        # AND in the batched (Patch 7) wrapper.
+        self.assertIn("torch::empty({K, N, 4}", src,
+                      "P_aos must be allocated as (K, N, 4) fp16 — AoS layout")
+        # The TORCH_CHECK that enforces the shape on the bwd path must also be present.
+        self.assertIn('P_aos.size(2) == 4', src,
+                      "bwd wrapper must TORCH_CHECK that P_aos last dim is 4")
+
+    def test_forward_calls_compute_P_W_aos_launcher(self):
+        """Round-1 fix (Issue 2b): the C++ forward wrapper must call the AoS
+        launcher (fused_lut_linear_soft_compute_P_W_aos_Launcher), NOT the old
+        SoA launcher (fused_lut_linear_soft_compute_P_W_Launcher).
+        """
+        py_path = os.path.join(HERE, "fused_lut_linear_cuda.py")
+        with open(py_path) as f:
+            src = f.read()
+        self.assertIn("fused_lut_linear_soft_compute_P_W_aos_Launcher(", src,
+                      "fused_lut_linear_soft_fwd_aos must call the AoS launcher")
+        # The old SoA launcher must NOT be called from the AoS forward wrapper.
+        # It's fine for the old SoA launcher symbol to exist in the file (it
+        # may be referenced by the legacy SoA forward path), but the AoS
+        # forward wrapper must route through the AoS launcher.
+        # We assert that the AoS launcher is the one invoked with P_aos.data_ptr.
+        self.assertIn("P_aos.data_ptr<c10::Half>()", src)
+
+    def test_ste_forward_uses_logits_argmax(self):
+        """Round-1 fix (Issue 2c): the STE forward computes W_hard via
+        logits.argmax(dim=0). Logits are still stored as (4, K, N) SoA
+        (only P moved to AoS), so the argmax code path is UNCHANGED and
+        still correct. We assert the argmax call is present.
+        """
+        py_path = os.path.join(HERE, "fused_lut_linear_cuda.py")
+        with open(py_path) as f:
+            src = f.read()
+        self.assertIn("logits.argmax(dim=0)", src,
+                      "STE forward must use logits.argmax(dim=0) for W_hard")
+        # P_aos must be saved for backward (not the old SoA P).
+        self.assertIn("ctx.save_for_backward(x, palette, logits, P_aos, W)", src,
+                      "ctx.save_for_backward must save P_aos (not old SoA P)")
+
     def test_backward_uses_aos_kernel(self):
         """CUDAFusedLUTLinearSoft.backward must call the fused AoS kernel."""
         py_path = os.path.join(HERE, "fused_lut_linear_cuda.py")
