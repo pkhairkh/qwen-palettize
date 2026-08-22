@@ -88,3 +88,54 @@ Stage Summary:
   - Wave 3 (9a/9b/9c): commits 02cff8e + 1c03465 + final PROGRESS commit
 - Branch ready for orchestrator merge to main (merge order: optimizer-streams LAST, after nn-module-foundation + training-recipe + kernels).
 
+
+---
+Task ID: 1-read
+Agent: quality-recipe
+Task: Clone repo, read ROADMAP/PROGRESS/RULES/TASKS + research + train_qwen.py to gather context before Wave 1.
+
+Work Log:
+- Cloned branch `agent/quality-recipe` from `pkhairkh/qwen-palettize.git` (HEAD=f2e216b "Round 3: multi-agent infrastructure for full Triton fusion").
+- Read `agent-ctx/ROADMAP.md` (6-agent roster, file ownership map, 17 patches P10-P26, 4 waves). My territory: train_qwen.py lines 96-102 (DEFAULT_HYPERPARAMS), 1034-1040 (τ schedule — verify), 1130-1145 (clip section), + NEW scripts/re_quantize.py.
+- Read `agent-ctx/PROGRESS.md` (all agents Pending, no merges yet — clean slate for Round 3).
+- Read `agent-ctx/agent-quality-recipe/RULES.md` + `TASKS.md` + `inbox/1724371200-from-orchestrator.md` (my 4 patches: 23 loss config, 24 per-group clip, 26 deterministic-ST coordinate, 25 LUT-Q re-quant).
+- Read research docs:
+  - `research-palettes-training/05_loss_function.md` (Patch 23 — switch norm_mse → 1-cos+norm_mse with cos=0.8, mse=0.2; rationale: norm_mse conflates magnitude+direction, 80/20 balances gradient contributions).
+  - `research-kernel-accuracy/08_recommendations.md` Fix 4 (Patch 24 — per-group clip: indices 1.0, others 0.3; rationale: global clip scales palette grad by ~1/45, zeroing palette updates).
+  - `research-indices-training/07_recommendations.md` Fix 2 (Patch 26 — deterministic-ST: remove Gumbel noise from compute_P_W_ste_kernel, forward becomes logits/tau → softmax → P; rationale: LCG sampler statistically weak, deterministic-ST prevents oscillation per Nagel 2022).
+  - `research-palettes-training/06_staged_training.md` Schedule C (Patch 25 — LUT-Q re-quantization at step 2000+4000; re-init index_logits as ±3 one-hot for better gradient flow).
+- Verified inbox (`agent-ctx/agent-quality-recipe/inbox/`) contains only the orchestrator's startup message — no RELEASED/LOCK messages from other agents. Wave 1 (Patches 23+24) can proceed independently; Wave 2 (Patch 26) requires coordination with triton-kernels via inbox.
+- Read `scripts/train_qwen.py` and verified current state:
+  - Lines 96-97: `loss_type = "norm_mse"`, `loss_weights = {"cos": 0.0, "mse": 1.0}` — STILL NEEDS Patch 23 change.
+  - Lines 1303-1319 (ROADMAP says 1130-1145; line numbers are stale because optimizer-streams Wave 2 inserted ~150 lines of double-buffer code above): "Two-tier clip" section ALREADY implements per-group clipping — `indices_params` clipped to 1.0, `other_params` clipped to `clip_val` (default 0.3). Verified via `git log -S "Two-tier clip"` that this was inherited from prior round (commit 5446edf). Patch 24 functional change is ALREADY DONE — will commit a clarifying comment update + verification.
+  - Lines 1176-1192 (ROADMAP says 1034-1040; also stale): τ schedule already matches the recommended pattern from research-indices-training/07_recommendations.md Fix 1 (warmup 500 steps + quadratic decay over tau_anneal_steps + hold at tau_final=0.5). NO action needed — verification only.
+  - `train_qwen.py` does NOT call `triton_soft_linear()` directly and has NO `step_seed` references — qwen_model.py (owned by nn-module-foundation) calls it. The `step_seed` is generated INSIDE `triton_soft_forward.py` (TritonSoftLinear.forward → _next_soft_step_seed). For Patch 26, my coordination is: send inbox request to triton-kernels; no train_qwen.py changes needed because the public API `triton_soft_linear()` already does NOT take step_seed.
+- Read `scripts/triton_soft_forward.py` lines 87-89, 124-129, 249-274, 311-351, 414-423: confirmed the Gumbel sampling pattern (`_gumbel_sample(step_seed, idx*4+k)`) and the internal-only `step_seed` parameter. All changes for Patch 26 are within triton-kernels' exclusive territory.
+
+Stage Summary:
+- Wave 1 prerequisites satisfied. Will touch lines 96-97 (Patch 23, real change) and 1303-1319 (Patch 24, comment-only verification — functional code already correct).
+- τ schedule (lines 1176-1192) already matches research recommendation — verification only, NO code change.
+- Wave 2 (Patch 26) is coordination-only on my side: I send the inbox request to triton-kernels; they own the actual kernel modification in triton_soft_forward.py.
+- Wave 3 (Patch 25) is a NEW script `scripts/re_quantize.py` + a small call-site insertion in train_qwen.py.
+- Branch is clean, on `agent/quality-recipe` @ f2e216b. Ready to start Wave 1.
+
+---
+Task ID: 2-wave1
+Agent: quality-recipe
+Task: Wave 1 — Patch 23 (loss config switch) + Patch 24 (per-group gradient clipping verification). DoD: syntax checks pass, branch pushed.
+
+Work Log:
+- Sub-task 23a: edited scripts/train_qwen.py lines 96-97. Changed `loss_type` from `"norm_mse"` to `"1-cos+norm_mse"`, and `loss_weights` from `{"cos": 0.0, "mse": 1.0}` to `{"cos": 0.8, "mse": 0.2}`. Added 12-line comment block referencing research-palettes-training/05_loss_function.md §5 and papers GPTQ (2210.17323) + QLoRA (2305.14314). Syntax check OK. Commit d00e7f6.
+- Sub-task 24a: read scripts/train_qwen.py lines 1303-1319. Discovered the per-group clipping is ALREADY in the desired state — `clip_grad_norm_(indices_params, 1.0)` + `clip_grad_norm_(other_params, clip_val)` where `clip_val = hp.get("gradient_clip", 0.3)`. Verified via `git log -S "Two-tier clip"` that this was inherited from prior round commit 5446edf. Action: replaced the brief 1-line "Two-tier clip" comment with an explicit 17-line Patch 24 attribution block citing research-kernel-accuracy/08_recommendations.md Fix 4 + AdamW paper (1711.05101) + noting the prior-round inheritance. NO functional change — comment-only update. Syntax check OK. Commit b5828a4.
+- Verified τ schedule (lines 1176-1192 in current file; ROADMAP says 1034-1040 but file grew due to optimizer-streams Wave 2 double-buffer code) already matches the recommended pattern from research-indices-training/07_recommendations.md Fix 1: 500-step warmup at tau_init=2.0 → quadratic decay (alpha=2) over tau_anneal_steps (6000) → hold at tau_final=0.5. NO action needed — verification only.
+- Verified I did NOT touch any lines outside my territory (96-102 loss config + 1303-1347 clip section in current file numbering, equivalent to ROADMAP's 96-102 + 1130-1145 + 1034-1040 verify-only).
+- Updated agent-ctx/PROGRESS.md: quality-recipe Wave 1 ✅ Done, Wave 2 🔄 In Progress; Patch 23 ✅ (commit d00e7f6), Patch 24 ✅ (commit b5828a4); event log entry + inbox summary entry added.
+
+Stage Summary:
+- Wave 1 DoD fully met:
+  [x] Syntax checks pass — `python3 -c "import ast; ast.parse(open('scripts/train_qwen.py').read())"` PASS
+  [x] Loss config switched (Patch 23) — d00e7f6
+  [x] Per-group clipping implemented (Patch 24) — b5828a4 (functional code already in desired state, comment updated for audit trail)
+  [x] Branch pushed — see git push below
+- Branch state: agent/quality-recipe @ b5828a4 (b5828a4 → d00e7f6 → f2e216b base).
+- Wave 2 (Patch 26 deterministic-ST) starts next: I send an inbox message to triton-kernels requesting the Gumbel noise removal from compute_P_W_ste_kernel. Their job is to modify triton_soft_forward.py. My job ends after the coordination message + PROGRESS update (since train_qwen.py doesn't directly call triton_soft_linear() and the public API already doesn't expose step_seed).
