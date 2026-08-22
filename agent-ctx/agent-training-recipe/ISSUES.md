@@ -65,10 +65,10 @@ Check that the formula matches the research in `research-indices-training/04_tau
 - Commit: `Fix 4: rebase on latest main`
 
 ## DoD
-- [ ] GROUP_SIZE = 256 (reverted, NOT 128)
-- [ ] No per-tensor override code
-- [ ] PROGRESS.md reset to main + appended
-- [ ] τ schedule verified correct
-- [ ] syntax check passes
-- [ ] Branch rebased on main
-- [ ] Branch pushed
+- [x] GROUP_SIZE = 256 (reverted, NOT 128) — `scripts/palettize_core.py:26`, file now byte-identical to `origin/main`
+- [x] No per-tensor override code — grep for `per_tensor|per-tensor|override|GS128` in palettize_core.py returns 0 matches (Patch 4b was already skipped in Round 1)
+- [x] PROGRESS.md reset to main + appended — reset via `git checkout origin/main -- agent-ctx/PROGRESS.md`, then appended one Event Log row + a "Round 2 — Fix Agent Status" section at the bottom (no existing table rows modified)
+- [x] τ schedule verified correct — 12 anchor checkpoints + 7 spec invariants all pass; matches `research-indices-training/04_tau_schedule.md` §6/§8 exactly. Also fixed stale function-signature defaults at `train_qwen.py:924` (were `tau_init=1.0, tau_final=0.01, tau_anneal_steps=4000`; now `2.0, 0.5, 6000` matching CLI defaults).
+- [x] syntax check passes — `palettize_core.py` and `train_qwen.py` both parse cleanly via `ast.parse`
+- [x] Branch rebased on main — `git rebase origin/main` succeeded with no conflicts (origin/main's only new commit `945edf3` added ISSUES.md files in `agent-ctx/`, which don't overlap with my changes)
+- [x] Branch pushed — see `git log origin/agent/training-recipe`
