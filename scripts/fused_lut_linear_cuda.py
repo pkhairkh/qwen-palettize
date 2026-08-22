@@ -214,6 +214,20 @@ void fused_lut_linear_soft_bwd_fused_Launcher(
     c10::Half* grad_logits, float* grad_palette,
     int M, int K, int N, int group_size);
 
+// Patch 5a — AoS-output compute_P_W launcher prototype (P written as (K,N,4))
+void fused_lut_linear_soft_compute_P_W_aos_Launcher(
+    const c10::Half* logits, const c10::BFloat16* palette,
+    c10::Half* P_aos, c10::BFloat16* W_out,
+    int K, int N, int group_size, float tau, uint32_t step_seed);
+
+// Patch 5b — AoS-reading fused backward launcher prototype
+// (reads P as (K,N,4) AoS; grad_logits output still (4,K,N) SoA)
+void fused_lut_linear_soft_bwd_fused_aos_Launcher(
+    const c10::BFloat16* grad_y, const c10::BFloat16* x,
+    const c10::Half* P_aos, const c10::BFloat16* palette,
+    c10::Half* grad_logits, float* grad_palette,
+    int M, int K, int N, int group_size);
+
 // ── Soft forward wrapper ─────────────────────────────────────────────────────
 // Returns: (y, P, W)
 //   y: (M, N) bf16
@@ -358,6 +372,109 @@ std::vector<torch::Tensor> fused_lut_linear_soft_bwd_fused(
 
     return {grad_logits, grad_palette};
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PATCH 5 — AoS variants (forward writes P_aos as (K, N, 4); backward reads it)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Patch 5c.1: Soft forward (AoS P output) ─────────────────────────────────
+// Returns: (y, P_aos, W)
+//   y:     (M, N)    bf16
+//   P_aos: (K, N, 4) fp16 — saved for backward (contiguous, AoS)
+//   W:     (K, N)    bf16 — materialized weights, saved for backward
+//
+// The actual matmul y = x @ W is done here via torch::matmul (cuBLAS) so the
+// caller gets the same single-tensor return the SoA variant produced.
+std::vector<torch::Tensor> fused_lut_linear_soft_fwd_aos(
+    torch::Tensor x,         // (M, K) bf16 — used only to infer shapes/options
+    torch::Tensor palette,   // (G, 4) bf16
+    torch::Tensor logits,    // (4, K, N) fp16
+    int64_t group_size,
+    double tau,
+    int64_t step_seed
+) {
+    TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kBFloat16);
+    TORCH_CHECK(palette.is_cuda() && palette.dtype() == torch::kBFloat16);
+    TORCH_CHECK(logits.is_cuda() && logits.dtype() == torch::kHalf,
+                "logits must be fp16 (torch.kHalf)");
+    TORCH_CHECK(logits.dim() == 3 && logits.size(0) == 4, "logits must be (4, K, N)");
+
+    int K = logits.size(1);
+    int N = logits.size(2);
+    int G = palette.size(0);
+    TORCH_CHECK(palette.size(1) == 4, "palette must be (G, 4)");
+    TORCH_CHECK(N % group_size == 0, "N must be divisible by group_size");
+    TORCH_CHECK(N / group_size == G, "G mismatch: N/group_size != palette.size(0)");
+
+    // Allocate P_aos (K, N, 4) fp16 — contiguous last-dim, AoS layout
+    auto P_aos = torch::empty({K, N, 4}, logits.options());
+    auto W = torch::empty({K, N}, x.options());
+
+    fused_lut_linear_soft_compute_P_W_aos_Launcher(
+        logits.data_ptr<c10::Half>(),
+        palette.data_ptr<c10::BFloat16>(),
+        P_aos.data_ptr<c10::Half>(),
+        W.data_ptr<c10::BFloat16>(),
+        K, N, (int)group_size, (float)tau, (uint32_t)step_seed);
+
+    // y = x @ W + bias (cuBLAS, done in Python)
+    auto y = torch::matmul(x, W);
+
+    return {y, P_aos, W};
+}
+
+// ── Patch 5c.2: Fused soft backward (AoS P input) ───────────────────────────
+// Reads P_aos in (K, N, 4) AoS layout. Outputs grad_logits in (4, K, N) SoA
+// (optimizer + checkpoint format expect SoA logits/gradients).
+//
+// Inputs:
+//   grad_y:    (M, N)    bf16
+//   x:         (M, K)    bf16
+//   P_aos:     (K, N, 4) fp16 — AoS layout (from fused_lut_linear_soft_fwd_aos)
+//   palette:   (G, 4)    bf16
+//
+// Returns: (grad_logits, grad_palette)
+//   grad_logits:  (4, K, N) fp16  — SoA (matches existing autograd contract)
+//   grad_palette: (G, 4)    bf16  (after fp32 atomic accumulation)
+std::vector<torch::Tensor> fused_lut_linear_soft_bwd_fused_aos(
+    torch::Tensor grad_y,   // (M, N) bf16
+    torch::Tensor x,        // (M, K) bf16
+    torch::Tensor P_aos,    // (K, N, 4) fp16 — AoS
+    torch::Tensor palette,  // (G, 4) bf16
+    int64_t group_size
+) {
+    TORCH_CHECK(grad_y.is_cuda() && grad_y.dtype() == torch::kBFloat16);
+    TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kBFloat16);
+    TORCH_CHECK(P_aos.is_cuda() && P_aos.dtype() == torch::kHalf);
+    TORCH_CHECK(palette.is_cuda() && palette.dtype() == torch::kBFloat16);
+    TORCH_CHECK(P_aos.dim() == 3 && P_aos.size(2) == 4,
+                "P_aos must be (K, N, 4) fp16 (AoS layout)");
+
+    int M = x.size(0);
+    int K = x.size(1);
+    int N = grad_y.size(1);
+    int G = palette.size(0);
+
+    // Allocate grad_logits (4, K, N) fp16 — SoA OUTPUT (matches optimizer contract)
+    auto grad_logits = torch::empty({4, K, N}, P_aos.options());
+
+    // Allocate grad_palette (G, 4) fp32 (atomic accum), then cast to bf16 at the end
+    auto grad_palette_fp32 = torch::zeros({G, 4}, grad_y.options().dtype(torch::kFloat32));
+
+    fused_lut_linear_soft_bwd_fused_aos_Launcher(
+        grad_y.data_ptr<c10::BFloat16>(),
+        x.data_ptr<c10::BFloat16>(),
+        P_aos.data_ptr<c10::Half>(),
+        palette.data_ptr<c10::BFloat16>(),
+        grad_logits.data_ptr<c10::Half>(),
+        grad_palette_fp32.data_ptr<float>(),
+        M, K, N, (int)group_size);
+
+    // Cast grad_palette fp32 → bf16 for autograd compatibility
+    auto grad_palette = grad_palette_fp32.to(torch::kBFloat16);
+
+    return {grad_logits, grad_palette};
+}
 """
 
 
@@ -400,9 +517,14 @@ def _build_module():
         name="fused_lut_linear_cuda_ext",
         cpp_sources=[CPP_SOURCE],
         cuda_sources=[cu_source],
-        functions=["fused_lut_linear_fwd", "fused_lut_linear_bwd",
-                   "fused_lut_linear_soft_fwd", "fused_lut_linear_soft_bwd",
-                   "fused_lut_linear_soft_bwd_fused"],
+        functions=[
+            "fused_lut_linear_fwd", "fused_lut_linear_bwd",
+            "fused_lut_linear_soft_fwd", "fused_lut_linear_soft_bwd",
+            "fused_lut_linear_soft_bwd_fused",
+            # Patch 5: AoS variants — PalettizedLinear.forward/backward use these.
+            "fused_lut_linear_soft_fwd_aos",
+            "fused_lut_linear_soft_bwd_fused_aos",
+        ],
         extra_cuda_cflags=extra_cuda_cflags,
         extra_cflags=extra_cflags,
         verbose=True,
@@ -571,9 +693,11 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         mod = _get_module()
         step_seed = _next_soft_step_seed()
 
-        # Call C++ soft fwd — returns (y, P, W_soft)
+        # ── Patch 5c: call the AoS soft forward — returns (y, P_aos, W_soft)
+        # where P_aos is (K, N, 4) fp16 (contiguous AoS, used by the fused bwd
+        # kernel via a single coalesced 64-bit load per (j, o)).
         # W_soft = Σ_k P[k] * palette[g, k]  (soft blend, for gradient)
-        y_soft, P, W_soft = mod.fused_lut_linear_soft_fwd(
+        y_soft, P_aos, W_soft = mod.fused_lut_linear_soft_fwd_aos(
             x, palette, logits, group_size, float(tau), step_seed
         )
 
@@ -583,6 +707,10 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         # W = W_hard - W_soft.detach() + W_soft
         #   forward value = W_hard (exact one-hot → cos preserved)
         #   backward grad  = through W_soft (indices actually train)
+        #
+        # NOTE: STE uses logits.argmax(dim=0) — logits are still (4, K, N) SoA,
+        # so this code path is UNCHANGED by Patch 5. Only P's storage moved to
+        # (K, N, 4) AoS, and P is not referenced here (the STE uses logits + W_soft).
         with torch.no_grad():
             argmax_idx = logits.argmax(dim=0)  # (K, N) — hard index assignment
             # Gather: W_hard[k, n] = palette[n // group_size, argmax_idx[k, n]]
@@ -599,7 +727,8 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         if bias is not None:
             y = y + bias
 
-        ctx.save_for_backward(x, palette, logits, P, W)
+        # ctx saves P_aos as (K, N, 4) fp16 — Patch 5 layout.
+        ctx.save_for_backward(x, palette, logits, P_aos, W)
         ctx.group_size = group_size
         ctx.tau = tau
         ctx.has_bias = bias is not None
@@ -607,7 +736,8 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y):
-        x, palette, logits, P, W = ctx.saved_tensors
+        # Patch 5c: ctx saved P as (K, N, 4) fp16 AoS — alias to P_aos for clarity.
+        x, palette, logits, P_aos, W = ctx.saved_tensors
         grad_y = grad_y.contiguous()
 
         needs_grad_x = ctx.needs_input_grad[0]
@@ -625,55 +755,40 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         if needs_grad_x:
             grad_x = torch.matmul(grad_y, W.T)
 
-        # ── PHASE IX.c: Hybrid bwd — cuBLAS matmul + PyTorch vectorized elementwise ──
-        # The pure-CUDA fused kernel (IX.b) was 3.8× SLOWER than PyTorch vectorized
-        # ops because of strided global memory access to P (4, K, N). PyTorch's
-        # vectorized ops use coalesced memory access patterns and are much faster.
+        # ── Patch 5c: re-enable the fused CUDA backward kernel (AoS P variant) ──
         #
-        # Strategy:
-        #   1. grad_W = x.T @ grad_y  (cuBLAS tensor cores — 0.06 ms)
-        #   2. grad_logits = elementwise via PyTorch (vectorized, coalesced)
-        #   3. grad_palette = reshape + sum (no atomics needed!)
+        # Previously (PHASE IX.c), the fused CUDA bwd kernel was disabled because
+        # its 4 strided loads to P[k * plane_size + idx] for k = 0..3 each hit
+        # a separate L2 cache line 26 MB apart, making the kernel 3.8× slower
+        # than the PyTorch elementwise path. The PyTorch path materialised a
+        # (K, N, 4) fp32 intermediate via P.permute(1, 2, 0).float() — ~100 MB
+        # of intermediate traffic per layer × 25 layers = ~2.5 GB / step.
         #
-        # This materializes a (K, N) fp32 grad_W tensor (~26 MB for K=N=2560),
-        # but it's 4× faster than the fused CUDA kernel with strided reads.
+        # With the AoS layout (Patch 5a + 5b), P_aos[idx * 4 + 0..3] loads the
+        # 4 fp16 values via a single coalesced 64-bit LDG — eliminating the
+        # strided access entirely. The fused kernel is now faster than the
+        # Python elementwise path AND avoids the (K, N, 4) fp32 intermediate.
+        #
+        # Path:
+        #   1. grad_x   = grad_y @ W.T                (cuBLAS, computed above)
+        #   2. grad_W (on-the-fly) + grad_logits + grad_palette
+        #        = mod.fused_lut_linear_soft_bwd_fused_aos(grad_y, x, P_aos, palette, GS)
         grad_logits = None
         grad_palette = None
         if needs_grad_logits or needs_grad_palette:
-            # PERF: skip grad_logits entirely when one-hot + low tau (grad is always 0).
-            # Empirically verified at tau=0.1 with logits=±10: all 25 index_logits
-            # grads are 0.0. The L4 "training" of indices was a no-op.
-            # Compute grad_logits by default (STE makes it non-zero).
-            # Set SKIP_ZERO_GRAD_LOGITS=1 to skip (legacy behavior, for benchmarking).
-            skip_grad_logits = os.environ.get("SKIP_ZERO_GRAD_LOGITS", "0") == "1"
-
-            # grad_palette only needs grad_W * P (cheaper than full grad_logits path)
-            # Use bf16 matmul for grad_W (faster, sufficient precision for palette grad)
-            grad_W = torch.matmul(x.T, grad_y)  # (K, N) bf16
-
-            if needs_grad_palette:
-                # grad_palette[g, k] = Σ_{j, o in group g} grad_W[j, o] * P[j, o, k]
-                # Compute via reshape + sum — no (K,N,4) fp32 materialization.
-                # P is (4, K, N) fp16. Permute to (K, N, 4) but keep fp16 to save memory.
-                P_kno = P.permute(1, 2, 0)  # (K, N, 4) fp16, no float() cast
-                # grad_W (K,N) bf16 → expand to (K,N,1) → multiply with P_kno (K,N,4) fp16
-                # Result is (K,N,4) fp16 (autocast handles bf16×fp16 → fp16)
-                contributions = (grad_W.unsqueeze(-1) * P_kno).view(K, G, GS, 4)
-                grad_palette = contributions.sum(dim=(0, 2)).to(torch.bfloat16)
-
-            if needs_grad_logits and not skip_grad_logits:
-                # Full grad_logits computation (only if not skipping)
-                grad_W_f = grad_W.float()
-                P_kno_f = P.permute(1, 2, 0).float()
-                g_idx = torch.arange(N, device=x.device) // GS
-                pal_pos = palette[g_idx.long()].unsqueeze(0).expand(K, N, 4).float()
-                W_val = (P_kno_f * pal_pos).sum(dim=-1)
-                grad_logits = (
-                    grad_W_f.unsqueeze(-1) * P_kno_f * (pal_pos - W_val.unsqueeze(-1))
-                ).to(torch.float16).permute(2, 0, 1).contiguous()
-            elif needs_grad_logits:
-                # Skip — return zero grad (matches actual behavior at low tau)
+            mod = _get_module()
+            grad_logits, grad_palette = mod.fused_lut_linear_soft_bwd_fused_aos(
+                grad_y, x, P_aos, palette, GS
+            )
+            # Optional env-var escape hatch for benchmarking against the legacy
+            # zero-grad path (the indices at very low τ converge to one-hot and
+            # the gradient is ~0, so skipping is a valid optimisation in some runs).
+            if needs_grad_logits and os.environ.get("SKIP_ZERO_GRAD_LOGITS", "0") == "1":
                 grad_logits = torch.zeros_like(logits)
+            if not needs_grad_logits:
+                grad_logits = None
+            if not needs_grad_palette:
+                grad_palette = None
 
         # grad_bias = grad_y.sum(dim=0)
         grad_bias = None
