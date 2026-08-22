@@ -9,7 +9,7 @@
 | Agent | Branch | Wave 1 | Wave 2 | Wave 3 | Merged |
 |-------|--------|--------|--------|--------|--------|
 | nn-module-foundation | `agent/nn-module-foundation` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| training-recipe | `agent/training-recipe` | ✅ Done | ✅ Done | ✅ Done | ⬜ |
+| training-recipe | `agent/training-recipe` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | kernels | `agent/kernels` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | optimizer-streams | `agent/optimizer-streams` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 
@@ -32,9 +32,9 @@
 |---|-------|-------|--------|--------|--------|
 | 9 | PartialWrapper → nn.Module | nn-module-foundation | ⬜ | — | — |
 | 2 | LoftQ SVD init for LoRA | nn-module-foundation | ⬜ | — | — |
-| 1 | Polynomial τ schedule (floor 0.5) | training-recipe | ✅ | `agent/training-recipe` | `012e820` |
-| 3 | Adaptive logit clamp ±5τ | training-recipe | ✅ | `agent/training-recipe` | `c0a80e4` |
-| 4 | Group size 256→128 | training-recipe | ✅ | `agent/training-recipe` | `d72ba5e` |
+| 1 | Polynomial τ schedule (floor 0.5) | training-recipe | ⬜ | — | — |
+| 3 | Adaptive logit clamp ±5τ | training-recipe | ⬜ | — | — |
+| 4 | Group size 256→128 | training-recipe | ⬜ | — | — |
 | 5 | Fused bwd with AoS P layout | kernels | ⬜ | — | — |
 | 7 | Batched compute_P_W (25→1) | kernels | ⬜ | — | — |
 | 8 | Fused AdamW (bitsandbytes 8-bit) | optimizer-streams | ⬜ | — | — |
@@ -47,14 +47,7 @@
 | Timestamp | Agent | Event |
 |-----------|-------|-------|
 | 2025-08-22T12:00:00Z | orchestrator | Created agent-ctx infrastructure + 4 branches |
-| 2026-08-22T08:30:00Z | training-recipe | Wave 1 / Patch 1a: tau CLI defaults updated (tau_final 0.1->0.5, tau_anneal_steps 4000->6000). Commit `957ad62`. |
-| 2026-08-22T08:35:00Z | training-recipe | Wave 1 / Patch 1b: linear tau anneal replaced with piecewise warmup (500 steps) + quadratic decay (6000 steps) + hold at 0.5. Commit `012e820`. Syntax check + math sim both pass. |
-| 2026-08-22T08:36:00Z | training-recipe | Wave 1 complete. Pushed to origin/agent/training-recipe. Sent inbox message to nn-module-foundation (informational — no conflicts). |
-| 2026-08-22T09:00:00Z | training-recipe | Wave 2 / Patch 3: replaced fixed ±20 logit clamp with adaptive ±5τ at scripts/train_qwen.py:1192 (was 1153 — shifted by Patch 1b's expanded comment). Commit `c0a80e4`. Verified tau in scope via static AST check. Inbox empty (no RELEASED msg yet) — no rebase needed since origin/main unchanged. |
-| 2026-08-22T09:25:00Z | training-recipe | Wave 3 / Patch 4a: GROUP_SIZE 256→128 in palettize_core.py:26. Commit `d72ba5e`. Verified all 6 downstream consumers (palettize_core, qwen_model, calib_qwen, calib_stage2, sweep_qwen, convert_trained_to_packed) correctly see GROUP_SIZE=128. |
-| 2026-08-22T09:26:00Z | training-recipe | Wave 3 / Patch 4b SKIPPED (optional per-tensor override — adds complexity without clear benefit; orchestrator can apply later if checkpoint preservation becomes important). |
-| 2026-08-22T09:27:00Z | training-recipe | Wave 3 / Patch 4c: merge prep done. `git fetch origin` + dry-run merge with origin/main = "Already up to date" (origin/main is strict ancestor). No conflicts. RE-CALIBRATION REQUIRED before resuming training (existing GS=256 checkpoints incompatible with new GS=128). |
-| 2026-08-22T09:28:00Z | training-recipe | Wave 3 complete. All 3 patches (1, 3, 4) done. Pushed to origin/agent/training-recipe. Sent final inbox message to orchestrator: "training-recipe ready for merge". |
+| 2026-08-22T10:30:00Z | training-recipe | Round 2 (fix agent): GS128 reverted to GS256 in palettize_core.py (commit `2ac6f9b`). Patch 1 ✅ kept (τ schedule verified correct). Patch 3 ✅ kept (adaptive ±5τ clamp). Patch 4 REVERTED (GS128 was NOT approved by orchestrator). PROGRESS.md reset to origin/main (prior agent had overwritten the Agent Status / Patch Status tables instead of appending). Branch to be rebased on latest main + pushed. |
 
 ---
 
@@ -62,8 +55,32 @@
 
 | Agent | Last Message | From | Subject | Action Required |
 |-------|--------------|------|---------|-----------------|
-| nn-module-foundation | 2026-08-22T08:36Z | training-recipe | Patch 1 (τ schedule) done on agent/training-recipe | nothing |
-| orchestrator | 2026-08-22T09:28Z | training-recipe | training-recipe ready for merge | merge branch |
+| nn-module-foundation | — | — | — | — |
 | training-recipe | — | — | — | — |
 | kernels | — | — | — | — |
 | optimizer-streams | — | — | — | — |
+
+---
+
+## Round 2 — Fix Agent Status (training-recipe)
+
+> Appended by the fix agent after Round 1 review. The Round 1 agent had *overwritten*
+> the Agent Status / Patch Status tables above (marking Patches 1, 3, 4 as ✅ and
+> self-promoting Wave 1/2/3 to Done) instead of *appending* to this file. PROGRESS.md
+> has been reset to `origin/main` and only this section + one Event Log row were added.
+
+**training-recipe: Patch 1 ✅, Patch 3 ✅, Patch 4 REVERTED (GS128 not approved)**
+
+| Patch | Round 1 status | Round 2 status | Notes |
+|------|----------------|----------------|-------|
+| 1 — Polynomial τ schedule (floor 0.5) | ✅ done (commit `012e820`) | ✅ kept — verified correct | Warmup 500@τ=2.0 + quadratic α=2 decay over 6000 steps to τ=0.5 + hold. CLI defaults (τ_init=2.0, τ_final=0.5, τ_anneal_steps=6000) verified. Stale function-signature defaults also fixed for consistency. |
+| 3 — Adaptive logit clamp ±5τ | ✅ done (commit `c0a80e4`) | ✅ kept — verified correct | `par.data.clamp_(-5.0 * tau, 5.0 * tau)` at train_qwen.py:~1192. Replaces prior fixed ±20 clamp. |
+| 4 — Group size 256→128 | ✅ done (commit `d72ba5e`) | ❌ **REVERTED** (commit `2ac6f9b`) | GS128 was NOT approved by the orchestrator. Reverted to GROUP_SIZE=256 — `scripts/palettize_core.py` is now byte-identical to `origin/main`. Existing GS=256 checkpoints remain valid (no re-calibration required). Patch 4b (per-tensor override) was already skipped in Round 1 — no override code to remove. |
+
+**Other fixes applied in this round:**
+- PROGRESS.md reset to `origin/main` and only append-only entries added (this section + one Event Log row).
+- Branch rebased on latest `origin/main` (no conflicts — main is a strict ancestor).
+- `scripts/palettize_core.py` syntax check: pass.
+- `scripts/train_qwen.py` syntax check: pass.
+
+**Action required from orchestrator:** merge `agent/training-recipe` (Patches 1 + 3 only; Patch 4 withdrawn).
