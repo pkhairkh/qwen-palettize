@@ -162,6 +162,7 @@ class FP32MasterOptimizer:
 
     def __init__(self, param_groups, opt_class, **opt_kwargs):
         self.model_param_map = {}  # id(fp32_master) → bf16 model param
+        self.master_grads = {}     # id(fp32_master) → pre-allocated fp32 grad buffer
         new_param_groups = []
         for group in param_groups:
             new_group = dict(group)
@@ -170,6 +171,8 @@ class FP32MasterOptimizer:
                 master = p.data.float().clone()
                 master.requires_grad_(True)
                 self.model_param_map[id(master)] = p
+                # Pre-allocate fp32 grad buffer (avoids per-step allocation)
+                self.master_grads[id(master)] = torch.empty_like(master)
                 new_params.append(master)
             new_group["params"] = new_params
             new_param_groups.append(new_group)
@@ -184,14 +187,18 @@ class FP32MasterOptimizer:
         return self.opt.state
 
     def step(self, closure=None):
+        # Copy bf16 grads → pre-allocated fp32 master grads (no allocation here)
         for group in self.opt.param_groups:
             for master in group["params"]:
                 p = self.model_param_map[id(master)]
                 if p.grad is not None:
-                    master.grad = p.grad.float()
+                    grad_buf = self.master_grads[id(master)]
+                    grad_buf.copy_(p.grad)  # bf16 → fp32 in-place (single copy_ kernel)
+                    master.grad = grad_buf
                 else:
                     master.grad = None
         self.opt.step(closure=closure)
+        # Copy fp32 masters → bf16 model params (in-place copy_, no allocation)
         with torch.no_grad():
             for group in self.opt.param_groups:
                 for master in group["params"]:

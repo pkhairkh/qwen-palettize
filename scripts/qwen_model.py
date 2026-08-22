@@ -101,18 +101,33 @@ class PalettizedLinear(nn.Module):
         group_idx_2d = group_idx.unsqueeze(0).expand(si, so)
         self.register_buffer("_flat_idx", (group_idx_2d * palette_size + indices).contiguous())
 
-        # Load CUDA kernels
+        # Load kernels — prefer Triton (Wave 3 of triton-rewrite branch),
+        # fall back to CUDA C (legacy), fall back to PyTorch (worst case).
         self._hard_kernel = None
         self._soft_kernel = None
         self._use_cuda = False
+        self._use_triton = False
+        self._triton_soft_kernel = None
+        self._triton_hard_kernel = None
         if not pre_transposed:
+            # Try Triton path first (no CUDA C, no torch.matmul, no Python elementwise)
             try:
-                import fused_lut_linear_cuda
-                self._hard_kernel = fused_lut_linear_cuda.fused_lut_linear
-                self._soft_kernel = fused_lut_linear_cuda.fused_lut_linear_soft
-                self._use_cuda = True
+                from triton_soft_forward import triton_soft_linear
+                from triton_hard_forward import triton_hard_linear
+                self._triton_soft_kernel = triton_soft_linear
+                self._triton_hard_kernel = triton_hard_linear
+                self._use_triton = True
             except Exception:
                 pass
+            # CUDA C path (legacy — used only if Triton path unavailable)
+            if not self._use_triton:
+                try:
+                    import fused_lut_linear_cuda
+                    self._hard_kernel = fused_lut_linear_cuda.fused_lut_linear
+                    self._soft_kernel = fused_lut_linear_cuda.fused_lut_linear_soft
+                    self._use_cuda = True
+                except Exception:
+                    pass
 
         # Trainable indices via Gumbel-Softmax
         self.use_soft_indices = use_soft_indices
@@ -137,7 +152,21 @@ class PalettizedLinear(nn.Module):
         else:
             x_flat = x
 
-        if self._use_cuda and x_flat.is_cuda and not self.pre_transposed:
+        # ── Triton path (preferred — Wave 3 of triton-rewrite branch) ──────
+        # Fuses Gumbel+softmax+STE+matmul (soft) and gather+matmul (hard)
+        # into Triton kernels. No CUDA C, no torch.matmul, no Python elementwise.
+        if self._use_triton and x_flat.is_cuda and not self.pre_transposed:
+            if self.training and self.use_soft_indices and self.index_logits is not None:
+                y = self._triton_soft_kernel(
+                    x_flat, self.palette, self.index_logits,
+                    self.bias, self.group_size, self.tau
+                )
+            else:
+                y = self._triton_hard_kernel(
+                    x_flat, self.palette, self.indices_int8,
+                    self.bias, self.group_size
+                )
+        elif self._use_cuda and x_flat.is_cuda and not self.pre_transposed:
             if self.training and self.use_soft_indices and self.index_logits is not None:
                 # Soft forward: Gumbel-Softmax relaxation
                 # W = Σ_k P[k] * palette[k], gradients flow to index_logits
