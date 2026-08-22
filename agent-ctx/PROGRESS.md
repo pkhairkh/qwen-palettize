@@ -9,7 +9,7 @@
 | Agent | Branch | Wave 1 | Wave 2 | Wave 3 | Merged |
 |-------|--------|--------|--------|--------|--------|
 | nn-module-foundation | `agent/nn-module-foundation` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| training-recipe | `agent/training-recipe` | ✅ Done | 🔄 In Progress | ⬜ Pending | ⬜ |
+| training-recipe | `agent/training-recipe` | ✅ Done | ✅ Done | 🔄 In Progress | ⬜ |
 | kernels | `agent/kernels` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | optimizer-streams | `agent/optimizer-streams` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 
@@ -33,7 +33,7 @@
 | 9 | PartialWrapper → nn.Module | nn-module-foundation | ⬜ | — | — |
 | 2 | LoftQ SVD init for LoRA | nn-module-foundation | ⬜ | — | — |
 | 1 | Polynomial τ schedule (floor 0.5) | training-recipe | ✅ | `agent/training-recipe` | `012e820` |
-| 3 | Adaptive logit clamp ±5τ | training-recipe | ⬜ | — | — |
+| 3 | Adaptive logit clamp ±5τ | training-recipe | ✅ | `agent/training-recipe` | `c0a80e4` |
 | 4 | Group size 256→128 | training-recipe | ⬜ | — | — |
 | 5 | Fused bwd with AoS P layout | kernels | ⬜ | — | — |
 | 7 | Batched compute_P_W (25→1) | kernels | ⬜ | — | — |
@@ -50,6 +50,7 @@
 | 2026-08-22T08:30:00Z | training-recipe | Wave 1 / Patch 1a: tau CLI defaults updated (tau_final 0.1->0.5, tau_anneal_steps 4000->6000). Commit `957ad62`. |
 | 2026-08-22T08:35:00Z | training-recipe | Wave 1 / Patch 1b: linear tau anneal replaced with piecewise warmup (500 steps) + quadratic decay (6000 steps) + hold at 0.5. Commit `012e820`. Syntax check + math sim both pass. |
 | 2026-08-22T08:36:00Z | training-recipe | Wave 1 complete. Pushed to origin/agent/training-recipe. Sent inbox message to nn-module-foundation (informational — no conflicts). |
+| 2026-08-22T09:00:00Z | training-recipe | Wave 2 / Patch 3: replaced fixed ±20 logit clamp with adaptive ±5τ at scripts/train_qwen.py:1192 (was 1153 — shifted by Patch 1b's expanded comment). Commit `c0a80e4`. Verified tau in scope via static AST check. Inbox empty (no RELEASED msg yet) — no rebase needed since origin/main unchanged. |
 
 ---
 
