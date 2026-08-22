@@ -88,3 +88,27 @@ Stage Summary:
   - Wave 3 (9a/9b/9c): commits 02cff8e + 1c03465 + final PROGRESS commit
 - Branch ready for orchestrator merge to main (merge order: optimizer-streams LAST, after nn-module-foundation + training-recipe + kernels).
 
+
+---
+Task ID: triton-1-read
+Agent: triton-kernels
+Task: Clone repo, read ROADMAP/PROGRESS/RULES/TASKS + research + existing Triton kernels to gather context before Wave 1.
+
+Work Log:
+- Cloned branch `agent/triton-kernels` from `pkhairkh/qwen-palettize.git`.
+- Read `agent-ctx/ROADMAP.md` (6-agent roster, 17 patches P10-P26, 4-wave merge order; triton-kernels owns P15/P16/P17/P18).
+- Read `agent-ctx/PROGRESS.md` (all 6 agents Pending; triton-kernels no inbox messages yet).
+- Read `agent-ctx/agent-triton-kernels/TASKS.md` (Wave 1: P16+P17; Wave 2: P15+P18; DoD = syntax + import check + push).
+- Read `agent-ctx/agent-triton-kernels/RULES.md` (exclusive ownership of triton_soft_forward/backward/hard_forward + bench_triton_kernels; cannot touch qwen_model.py / train_qwen.py / new layer-fusion/lora-fusion files).
+- Read research docs: `03_batched_compute_pw.md` (Patch 15 design — single kernel grid (cdiv(max_K,BM), cdiv(max_N,BN), 25)), `01_gumbel_softmax_audit.md` Finding 8 (Patch 16 — the wasted W_soft store), `05_memory_optimization.md` §3.2 (Patch 17 — buffer pooling for P_aos + W_ste) + §3.3 (Patch 18 — chunked reduction to eliminate grad_W HBM intermediate).
+- Read existing `scripts/triton_soft_forward.py` (423 lines, compute_P_W_ste_kernel + fused_soft_matmul_kernel + TritonSoftLinear autograd.Function).
+- Read existing `scripts/triton_soft_backward.py` (413 lines, grad_x + grad_W + elementwise kernels).
+- Verified inbox (`agent-ctx/agent-triton-kernels/inbox/1724371200-from-orchestrator.md`) — orchestrator message: "Start Wave 1 — implement Patches 16 + 17". No blocking dependencies.
+- Read prior worklog (optimizer-streams Wave 1/2/3 — completed; no conflicts with my territory).
+- Inspected qwen_model.py PalettizedLinear.forward (line 160): calls `triton_soft_linear(x, palette, logits, bias, group_size, tau)` — public API is stable.
+
+Stage Summary:
+- Wave 1 prerequisites satisfied. Wave 1 touches scripts/triton_soft_forward.py (mine), scripts/triton_soft_backward.py (mine, for Patch 17 buffer pooling), bench_triton_kernels.py + tests (mine/shared, must update for new API).
+- Key finding: the redundant `y_soft = x @ W_soft` matmul (CUDA-era bug) is ALREADY eliminated by the prior Wave 1 Triton rewrite (commit `4e93ae3`); Patch 16's actual scope is narrower — eliminate the still-present W_soft *computation and HBM write* inside compute_P_W_ste_kernel. The kernel was writing W_soft to HBM "as a debug aid" but it was never consumed by the backward (which reconstructs it on-the-fly from P_aos + palette). Removing the W_soft store removes ~26MB write + ~26MB read per layer × 25 layers = ~1.3 GB/step HBM traffic.
+- Installed torch (CPU-only via --no-deps) + triton in venv for syntax + import checks (no GPU).
+- Beginning Patch 16 implementation.

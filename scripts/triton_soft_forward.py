@@ -7,10 +7,12 @@ kernels.
 
 WAVE 1 — fused_soft_forward:
   - `compute_P_W_ste_kernel`: per-(j, o) kernel — samples Gumbel noise, softmax → P
-    (4 values), writes P_aos (K,N,4) fp16, computes W_soft = Σ P[k]*palette[g,k]
-    and W_hard = palette[g, argmax(logits)], and writes W_ste = W_hard (forward
-    value; gradients route through W_soft in the backward via on-the-fly
-    reconstruction from P_aos + palette).
+    (4 values), writes P_aos (K,N,4) fp16, computes W_hard = palette[g, argmax(logits)]
+    and writes W_ste = W_hard (forward value; gradients route through W_soft in
+    the backward via on-the-fly reconstruction from P_aos + palette).
+    [Patch 16: W_soft is NOT computed or stored here — see research-indices-training/
+    01_gumbel_softmax_audit.md Finding 8. The forward only uses W_ste; the backward
+    recomputes W_soft from P_aos + palette on-the-fly.]
   - `fused_soft_matmul_kernel`: standard Triton matmul, y = x @ W_ste + bias.
   - `TritonSoftLinear` (torch.autograd.Function): forward wires the two kernels
     + saves ctx. Backward is filled in by Wave 2.
@@ -23,9 +25,6 @@ Layouts (must match existing CUDA path):
   y:        (M, N) bf16
   P_aos:    (K, N, 4) fp16 — last dim is the 4 planes (AoS for coalesced 64-bit
             load in the backward)
-  W_soft:   (K, N) bf16 — materialised for backward reference path (Triton bwd
-            recomputes W_soft from P_aos + palette on-the-fly, so this is
-            optional — saved only as a debug aid / fallback path)
   W_ste:    (K, N) bf16 — the STE weight (= W_hard numerically) used in the
             forward matmul AND saved for grad_x = grad_y @ W_ste.T in the backward
 """
@@ -67,8 +66,14 @@ def _gumbel_sample(seed, idx):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# KERNEL 1a — compute P_aos + W_soft + W_ste (one program per (j, o) tile)
+# KERNEL 1a — compute P_aos + W_ste (one program per (j, o) tile)
 # ═════════════════════════════════════════════════════════════════════════════
+# Patch 16 (research-indices-training/01_gumbel_softmax_audit.md Finding 8):
+# This kernel previously ALSO computed and stored W_soft = Σ_k P[k]*palette[g,k]
+# to HBM (a wasted write — the forward only uses W_ste = W_hard for the matmul,
+# and the backward reconstructs W_soft on-the-fly from P_aos + palette). The
+# W_soft store + HBM write has been removed; the kernel now ONLY writes
+# P_aos (K,N,4) fp16 + W_ste (K,N) bf16.
 @triton.autotune(
     configs=[
         triton.Config({"BM": 16, "BN": 16}, num_warps=8, num_stages=1),
@@ -82,7 +87,7 @@ def _gumbel_sample(seed, idx):
 @triton.jit
 def compute_P_W_ste_kernel(
     logits_ptr, palette_ptr,
-    P_aos_ptr, W_soft_ptr, W_ste_ptr,
+    P_aos_ptr, W_ste_ptr,
     K, N, G,
     group_size: tl.constexpr,
     tau,
@@ -94,9 +99,10 @@ def compute_P_W_ste_kernel(
       * sample 4 Gumbel noises (deterministic LCG, matches CUDA)
       * (logits + gumbel) / tau → softmax → P[k]
       * store P_aos[j, o, 0..3]  (AoS — last dim is the 4 planes)
-      * W_soft = Σ_k P[k] * palette[g, k]  → store W_soft[j, o]
       * argmax over PLAIN logits (NO Gumbel) → W_hard = palette[g, argmax]
       * W_ste = W_hard  (forward value; gradients route through W_soft in bwd)
+    NOTE (Patch 16): W_soft is NOT computed here — it is recomputed on-the-fly
+    in the backward from P_aos + palette (see fused_soft_bwd_elementwise_kernel).
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -154,9 +160,6 @@ def compute_P_W_ste_kernel(
     c2 = tl.load(palette_ptr + pal_base + 2, mask=mask_n[None, :], other=0.0).to(tl.float32)
     c3 = tl.load(palette_ptr + pal_base + 3, mask=mask_n[None, :], other=0.0).to(tl.float32)
 
-    # ── W_soft = Σ_k P[k] * palette[g, k] ───────────────────────────────────
-    W_soft = p0 * c0 + p1 * c1 + p2 * c2 + p3 * c3  # (BM, BN) f32
-
     # ── argmax over PLAIN logits (NO Gumbel — matches existing CUDA path) ────
     # Use the canonical "first-index wins" tie-break: k wins iff it's strictly
     # greater than all earlier k's and ≥ all later k's. This matches
@@ -173,11 +176,11 @@ def compute_P_W_ste_kernel(
     W_hard = f0 * c0 + f1 * c1 + f2 * c2 + f3 * c3
 
     # STE: forward uses W_hard (numerically), backward routes through W_soft
+    # (recomputed on-the-fly from P_aos + palette in the elementwise kernel).
     W_ste = W_hard
 
-    # ── Write W_soft (debug) and W_ste ──
+    # ── Write W_ste (W_soft is NOT written — Patch 16) ──────────────────────
     idx_flat = j_grid * N + o_grid
-    tl.store(W_soft_ptr + idx_flat, W_soft.to(tl.bfloat16), mask=mask)
     tl.store(W_ste_ptr + idx_flat, W_ste.to(tl.bfloat16), mask=mask)
 
 
@@ -249,8 +252,12 @@ def compute_P_W_ste_triton(
     group_size: int,
     tau: float,
     step_seed: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (P_aos, W_soft, W_ste). All on the same device as `logits`."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (P_aos, W_ste). All on the same device as `logits`.
+
+    Patch 16: W_soft is NOT returned — the backward recomputes it on-the-fly
+    from P_aos + palette (see fused_soft_bwd_elementwise_kernel).
+    """
     assert logits.dtype == torch.float16, f"logits must be fp16, got {logits.dtype}"
     assert palette.dtype == torch.bfloat16, f"palette must be bf16, got {palette.dtype}"
     assert logits.shape[0] == 4
@@ -262,18 +269,17 @@ def compute_P_W_ste_triton(
     logits = logits.contiguous()
     palette = palette.contiguous()
     P_aos = torch.empty((K, N, 4), dtype=torch.float16, device=logits.device)
-    W_soft = torch.empty((K, N), dtype=torch.bfloat16, device=logits.device)
     W_ste = torch.empty((K, N), dtype=torch.bfloat16, device=logits.device)
 
     grid = lambda meta: (triton.cdiv(K, meta["BM"]), triton.cdiv(N, meta["BN"]))
     compute_P_W_ste_kernel[grid](
-        logits, palette, P_aos, W_soft, W_ste,
+        logits, palette, P_aos, W_ste,
         K, N, G,
         group_size=group_size,
         tau=float(tau),
         step_seed=int(step_seed),
     )
-    return P_aos, W_soft, W_ste
+    return P_aos, W_ste
 
 
 def fused_soft_matmul_triton(
@@ -320,7 +326,7 @@ class TritonSoftLinear(torch.autograd.Function):
     forward(ctx, x, palette, logits, bias, group_size, tau) -> y
       Steps:
         1. compute_P_W_ste_triton(logits, palette, group_size, tau, step_seed)
-           → (P_aos, W_soft, W_ste)
+           → (P_aos, W_ste)   [Patch 16: no W_soft — recomputed in backward]
         2. fused_soft_matmul_triton(x, W_ste, bias) → y
         3. ctx.save_for_backward(x, palette, logits, P_aos, W_ste)
 
@@ -345,7 +351,7 @@ class TritonSoftLinear(torch.autograd.Function):
         assert N // group_size == G
 
         step_seed = _next_soft_step_seed()
-        P_aos, W_soft, W_ste = compute_P_W_ste_triton(
+        P_aos, W_ste = compute_P_W_ste_triton(
             logits, palette, group_size, float(tau), step_seed
         )
 

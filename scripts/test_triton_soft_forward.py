@@ -120,12 +120,13 @@ def main():
     print(f"  bias: {bias.shape} {bias.dtype}")
     print()
 
-    # ── Run Triton forward (computes P_aos, W_soft, W_ste internally) ─────
+    # ── Run Triton forward (computes P_aos, W_ste internally) ─────────────
     print("Running Triton forward (compute_P_W_ste + matmul)...")
     # We don't use the autograd Function yet — call the sub-kernels directly so
-    # we can compare intermediate (P_aos, W_soft, W_ste) against the reference.
+    # we can compare intermediate (P_aos, W_ste) against the reference.
+    # Patch 16: compute_P_W_ste_triton returns (P_aos, W_ste) — no W_soft.
     step_seed = 42
-    P_aos, W_soft, W_ste = compute_P_W_ste_triton(
+    P_aos, W_ste = compute_P_W_ste_triton(
         logits, palette, group_size, tau, step_seed
     )
     y_triton = fused_soft_matmul_triton(x, W_ste, bias)
@@ -177,14 +178,20 @@ def main():
     assert P_min >= -1e-4, f"P has negative values (min={P_min})"
     assert P_max <= 1.0 + 1e-3, f"P > 1 (max={P_max})"
 
-    # (d) W_soft sanity: should be in palette range (convex combination of palette vals)
+    # (d) W_soft sanity: reconstruct from P_aos + palette (Patch 16: W_soft
+    # is no longer returned by compute_P_W_ste_triton — it is recomputed on-
+    # the-fly in the backward kernel. We reconstruct here to verify the same
+    # invariant: W_soft should be a convex combination of palette values.)
     pal_f = palette.float()
     pal_min = pal_f.min().item()
     pal_max = pal_f.max().item()
-    W_soft_min = W_soft.float().min().item()
-    W_soft_max = W_soft.float().max().item()
+    g_idx = torch.arange(N, device=logits.device) // group_size
+    pal_per_col = palette[g_idx.long()].float()  # (N, 4)
+    W_soft_recon = (P_aos_f * pal_per_col[None, :, :]).sum(dim=-1)  # (K, N)
+    W_soft_min = W_soft_recon.min().item()
+    W_soft_max = W_soft_recon.max().item()
     print(f"  palette range: [{pal_min:.4f}, {pal_max:.4f}]")
-    print(f"  W_soft range: [{W_soft_min:.4f}, {W_soft_max:.4f}]")
+    print(f"  W_soft (reconstructed) range: [{W_soft_min:.4f}, {W_soft_max:.4f}]")
     assert W_soft_min >= pal_min - 1e-3, f"W_soft below palette range"
     assert W_soft_max <= pal_max + 1e-3, f"W_soft above palette range"
 

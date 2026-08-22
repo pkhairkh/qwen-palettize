@@ -185,7 +185,7 @@ def bench_compute_P_W_ste(K, N, M):
         _ = palette[g_per_col.long(), argmax_idx]  # W_hard
     # Correctness — note: P values won't bit-match (different Gumbel RNG),
     # so just verify W_ste is in palette range + has correct argmax distribution
-    P_aos, W_soft, W_ste = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
+    P_aos, W_ste = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
     argmax_ref = logits.argmax(dim=0)
     g_idx = torch.arange(N, device=palette.device) // GROUP_SIZE
     g_per_col = g_idx[None, :].expand(K, N)
@@ -206,7 +206,7 @@ def bench_compute_P_W_ste(K, N, M):
 
 def bench_soft_matmul(K, N, M):
     x, palette, logits, _, bias, _, G = make_inputs(K, N, M)
-    _, _, W_ste = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
+    _, W_ste = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
     def triton_fn():
         fused_soft_matmul_triton(x, W_ste, bias)
     def torch_fn():
@@ -233,7 +233,7 @@ def bench_soft_matmul(K, N, M):
 
 def bench_soft_bwd_grad_x(K, N, M):
     x, palette, logits, _, bias, grad_y, G = make_inputs(K, N, M)
-    _, _, W_ste = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
+    _, W_ste = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
     def triton_fn():
         fused_soft_bwd_grad_x_triton(grad_y, W_ste)
     def torch_fn():
@@ -279,7 +279,7 @@ def bench_soft_bwd_grad_W(K, N, M):
 
 def bench_soft_bwd_elementwise(K, N, M):
     x, palette, logits, _, _, grad_y, G = make_inputs(K, N, M)
-    P_aos, _, _ = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
+    P_aos, _ = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
     grad_W = fused_soft_bwd_grad_W_triton(x, grad_y)
     def triton_fn():
         fused_soft_bwd_elementwise_triton(grad_W, P_aos, palette, GROUP_SIZE)

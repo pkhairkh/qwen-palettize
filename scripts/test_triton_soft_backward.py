@@ -152,7 +152,8 @@ def main():
     import triton_soft_forward as tsf
     from triton_soft_forward import compute_P_W_ste_triton, fused_soft_matmul_triton
     step_seed = 123
-    P_aos, W_soft, W_ste = compute_P_W_ste_triton(
+    # Patch 16: compute_P_W_ste_triton returns (P_aos, W_ste) — no W_soft.
+    P_aos, W_ste = compute_P_W_ste_triton(
         logits, palette, group_size, tau, step_seed
     )
     y_triton = fused_soft_matmul_triton(x, W_ste, bias)
