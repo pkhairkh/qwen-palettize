@@ -554,6 +554,18 @@ def load_qwen_model(model_name="Qwen/Qwen3.5-4B", device="cuda", dtype=torch.bfl
 # accelerate, transformers.Trainer, register_forward_hook, requires_grad_,
 # apply, and ~50 other nn.Module API methods. See research-architecture-
 # review/02_partial_wrapper_problem.md for the full diagnosis.
+#
+# Patch 11b verification (agent/nn-module-foundation, Wave 1):
+#   ✓ PartialModel(nn.Module) — inherits nn.Module, calls super().__init__(),
+#     stores layers as nn.ModuleList(layers).
+#   ✓ PartialWrapper(nn.Module) — inherits nn.Module, calls super().__init__(),
+#     wraps a PartialModel as self.model submodule.
+#   ✓ Neither class defines hand-rolled parameters/named_parameters/
+#     named_modules/to/eval/train/get_submodule/state_dict/load_state_dict
+#     — all inherited from nn.Module.
+#   ✓ Both classes define a forward(input_ids, position_ids) method, so
+#     torch.compile / Trainer / hooks can call them as callables.
+#   Verified offline via AST inspection (no torch import needed).
 class PartialModel(nn.Module):
     """Prefix of Qwen3.5: embed_tokens + rotary_emb + first N layers + optional norm.
 
