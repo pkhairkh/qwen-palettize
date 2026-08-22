@@ -1031,9 +1031,31 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
     for batch_ids in data_stream:
         if global_step >= max_steps: break
 
-        # Temperature annealing for Gumbel-Softmax
+        # Temperature annealing for Gumbel-Softmax.
+        # Schedule (research-indices-training/04_tau_schedule.md §6):
+        #   1. Warmup (T_WARMUP=500 steps): hold tau at tau_init (2.0) for high
+        #      exploration — gradients are ~1.0× of the τ=2 baseline.
+        #   2. Quadratic decay (tau_anneal_steps steps): tau = tau_init *
+        #      (1 - progress)^2 with alpha=2. Front-loads the high-τ regime:
+        #      ~66% of training is spent at τ≥1.0 where P_loser≥0.09 and the
+        #      per-element Gumbel-Softmax gradient is ≥36% of peak.
+        #   3. Hold at tau_final (0.5): never below 0.5 — below 0.5 the
+        #      gradient magnitude for K=4 falls below 9% of peak (Table 1
+        #      in 04_tau_schedule.md) and indices effectively freeze.
+        # Net effect: ~62% boost in cumulative gradient signal vs the
+        # previous linear 2.0→0.1 schedule, and the indices stay trainable
+        # for the entire 8300-step run instead of freezing at step 4000.
         if use_soft_indices:
-            tau = max(tau_final, tau_init * (1.0 - global_step / tau_anneal_steps))
+            T_WARMUP = 500
+            T_ANNEAL = tau_anneal_steps  # 6000 by default
+            if global_step < T_WARMUP:
+                tau = tau_init  # 2.0 — warmup at high tau
+            elif global_step < T_WARMUP + T_ANNEAL:
+                progress = (global_step - T_WARMUP) / T_ANNEAL
+                # alpha=2 quadratic decay; max() floor at tau_final (0.5)
+                tau = max(tau_final, tau_init * (1.0 - progress) ** 2)
+            else:
+                tau = tau_final  # 0.5 — hold (NOT 0.1, which kills gradients)
             # Update tau on all PalettizedLinear modules
             for name, mod in student.named_modules():
                 if hasattr(mod, 'tau'):
