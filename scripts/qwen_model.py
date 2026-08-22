@@ -491,6 +491,47 @@ class PartialModel(nn.Module):
         return h
 
 
+class PartialWrapper(nn.Module):
+    """Thin nn.Module wrapper around a PartialModel.
+
+    Exists so that downstream code can treat the student / teacher prefix
+    as a single nn.Module (for torch.compile, FSDP, accelerate, Trainer,
+    state_dict, etc.) while still allowing the training loop to reach into
+    `.model.embed_tokens` / `.model.layers[i]` for streaming / CUDA-stream
+    overlap. All nn.Module API methods (parameters, named_parameters,
+    named_modules, state_dict, load_state_dict, to, eval, train, apply,
+    requires_grad_, register_forward_hook, ...) are inherited.
+    """
+    def __init__(self, partial_model, config):
+        super().__init__()
+        # partial_model is a PartialModel (nn.Module) — registered as a
+        # submodule named "model", so wrapper.named_parameters() yields
+        # keys like "model.layers.0.linear_attn.out_proj.lora_A".
+        self.model = partial_model
+        # config is plain metadata (HF config object); kept as attribute.
+        self.config = config
+
+    def forward(self, input_ids, position_ids=None):
+        """Delegate to the wrapped PartialModel."""
+        return self.model(input_ids, position_ids)
+
+
+# NOTE on key naming: after the nn.Module refactor, wrapper.named_parameters()
+# and wrapper.named_modules() yield keys prefixed with "model." (e.g.
+# "model.layers.0.linear_attn.out_proj.lora_A"). The pre-refactor hand-rolled
+# generators yielded keys WITHOUT the "model." prefix (e.g.
+# "layers.0.linear_attn.out_proj.lora_A"). save_state / load_state in
+# train_qwen.py derive filenames from these keys via name.replace(".", "_"),
+# so legacy trained/superblock_N_best/*.pt files (named
+# "layers_0_linear_attn_out_proj_lora_A.pt") will NOT round-trip with the new
+# key naming. This is a known consequence of the nn.Module refactor (see
+# research-architecture-review/02_partial_wrapper_problem.md §9 Risk #1 and
+# §6.3 for the migration shim proposal). Checkpoint migration is out of scope
+# for Patch 9 and will be handled separately by the orchestrator. New
+# checkpoints saved after this refactor will use the "model." prefix
+# consistently and will round-trip correctly.
+
+
 def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
                                  device="cuda", dtype=torch.bfloat16):
     """Load embed_tokens + layers 0 to sb_end-1 using standard from_pretrained.
@@ -536,62 +577,6 @@ def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
     # nn.Module subclasses (see above). The hand-rolled to/eval/train/
     # parameters/named_parameters/named_modules/get_submodule methods have
     # been deleted; nn.Module provides all of them correctly.
-    class PartialWrapper:
-        def __init__(self, partial_model, config):
-            self.model = partial_model
-            self.config = config
-
-        def to(self, device):
-            self.model = self.model.to(device)
-            return self
-
-        def eval(self):
-            self.model.eval()
-            return self
-
-        def train(self, mode=True):
-            for l in self.model.layers: l.train(mode)
-            return self
-
-        def parameters(self):
-            for p in self.model.embed_tokens.parameters(): yield p
-            for layer in self.model.layers:
-                for p in layer.parameters(): yield p
-            if self.model.norm is not None:
-                for p in self.model.norm.parameters(): yield p
-
-        def named_parameters(self):
-            for name, p in self.model.embed_tokens.named_parameters():
-                yield (f"embed_tokens.{name}", p)
-            for i, layer in enumerate(self.model.layers):
-                for name, p in layer.named_parameters():
-                    yield (f"layers.{i}.{name}", p)
-            if self.model.norm is not None:
-                for name, p in self.model.norm.named_parameters():
-                    yield (f"norm.{name}", p)
-
-        def named_modules(self):
-            for name, mod in self.model.named_modules():
-                yield (name, mod)
-
-        def get_submodule(self, name):
-            parts = name.split(".")
-            obj = self.model
-            for part in parts:
-                if part == "embed_tokens":
-                    obj = obj.embed_tokens
-                elif part == "layers":
-                    continue
-                elif part == "norm":
-                    obj = obj.norm
-                elif part == "rotary_emb":
-                    obj = obj.rotary_emb
-                elif part.isdigit():
-                    obj = obj.layers[int(part)]
-                else:
-                    obj = getattr(obj, part)
-            return obj
-
     partial = PartialModel(embed_tokens, rotary_emb, prefix_layers, final_norm, full_model_config)
     wrapper = PartialWrapper(partial, full_model_config)
 
