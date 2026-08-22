@@ -921,7 +921,7 @@ def stream_training_data(tokenizer, n_seqs, seq_len, device="cuda", batch_size=8
 # ─── Main training loop ────────────────────────────────────────────────
 def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=128, batch_size=8,
                       resume_from=None, use_soft_indices=False,
-                      tau_init=1.0, tau_final=0.01, tau_anneal_steps=4000,
+                      tau_init=2.0, tau_final=0.5, tau_anneal_steps=6000,
                       shutdown_on_done=False):
     _rewire_log(sb_idx)
     print(f"\n{'='*70}")
