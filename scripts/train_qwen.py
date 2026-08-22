@@ -1123,6 +1123,338 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
     event_s = [torch.cuda.Event(), torch.cuda.Event()]               # student-done events
     buf_idx = 0                                                      # ping-pong index
 
+    # ─── Patch 21 + 22 (Wave 4): CUDA Graph capture infrastructure ────────
+    # Research: research-kernel-efficiency/08_recommendations.md §11
+    #           research-kernel-efficiency/06_stream_overlap.md §6
+    #
+    # WHAT: Capture the full training step as TWO CUDA Graphs (teacher_graph
+    #       on stream_t + student_graph on default stream), replayed per step.
+    #       Eliminates ~500 kernel launch dispatches × 5µs = 2.5ms of CPU-side
+    #       dispatch overhead per step. Patch 22 integrates with the existing
+    #       Patch 6 stream double-buffer via event-based synchronization
+    #       between the two graphs (teacher fwd fully hidden behind student
+    #       compute, made deterministic by graph replay).
+    #
+    # REQUIREMENTS (08_recommendations.md §11):
+    #   1. Static input tensors — batch_ids copied into static_batch_ids
+    #      before each replay.
+    #   2. No dynamic shapes — batch_size, seq_len fixed at capture time.
+    #   3. No data-dependent control flow inside the graph (NaN check,
+    #      hyperparameter updates, LR scheduler step are OUTSIDE the graph).
+    #   4. 3-5 warmup steps before capture (settles Triton autotuner configs).
+    #
+    # RECAPTURE POLICY:
+    #   tau (Gumbel-Softmax temperature) and per-group LR are baked into the
+    #   captured kernels as Python-float kernel args. We re-capture every
+    #   CUDA_GRAPH_RECAPTURE_INTERVAL steps to pick up these changes. Over a
+    #   6000-step training run, this gives ~60 re-captures × ~50ms each =
+    #   ~3 seconds total — negligible vs. the ~600s of training time saved.
+    #   We ALSO re-capture when the live-JSON hyperparameters change (forces
+    #   immediate re-capture with the new freeze/LR configuration).
+    #
+    # OFFLINE CONSTRAINT (RULES.md §"Offline Constraint"):
+    #   CUDA Graph capture requires a GPU. The code below is syntactically
+    #   validated but NOT runtime-tested. On the server, capture failure sets
+    #   graph_capture_failed=True and silently falls back to the existing
+    #   eager path (training continues uninterrupted — the eager path is
+    #   preserved verbatim below the graph-replay branch).
+
+    # Static input buffer — shape fixed at capture time. The data pipeline
+    # yields (batch_size, seq_len) torch.long tensors on DEVICE.
+    static_batch_ids = torch.empty(batch_size, seq_len, dtype=torch.long, device=DEVICE)
+
+    # Static loss + cos tensors — read via .item() AFTER replay (the .item()
+    # sync forces CPU-GPU synchronization, which is forbidden inside capture).
+    # Two copies for ping-pong (the captured graphs bake in buf_idx-specific
+    # event/buffer addresses, so we need a separate graph pair per buf_idx).
+    static_loss  = [torch.zeros((), dtype=torch.float32, device=DEVICE) for _ in range(2)]
+    static_l_cos = [torch.zeros((), dtype=torch.float32, device=DEVICE) for _ in range(2)]
+
+    # Graph objects (one per buf_idx). Captured lazily after warmup.
+    teacher_graph = [None, None]   # Patch 22: captured on stream_t
+    student_graph = [None, None]   # Patch 21: captured on default stream
+
+    # Re-capture tracking.
+    # last_capture_step[buf_idx] = step at which this buf_idx's graph pair was
+    # last captured. -1 = never captured (force immediate capture next eligible
+    # step). Reset to -1 after NaN recovery or HP changes to force re-capture.
+    last_capture_step = [-1, -1]
+    # HP signature (json.dumps, sorted) baked into the captured graph. If the
+    # live-JSON hyperparams change, last_hp_sig (in the for-loop below) is
+    # updated and differs from this — forcing a re-capture.
+    last_capture_hp_sig = [None, None]
+
+    # Tunables
+    CUDA_GRAPH_WARMUP_STEPS = 3          # 3-5 eager steps before first capture
+    CUDA_GRAPH_RECAPTURE_INTERVAL = 100  # periodic re-capture for LR/tau pickup
+    graph_capture_failed = False         # if True, never try graph replay again
+
+    # ─── Graph-friendly helpers ──────────────────────────────────────────
+    # The standard compute_loss + clip_grad_norm_ call .item() internally,
+    # which forces a CPU-GPU sync and aborts CUDA Graph capture. These
+    # helpers duplicate the math without .item() — they return CUDA tensors
+    # which the caller writes to static_loss/static_l_cos and reads via
+    # .item() AFTER the graph replay (outside the captured region).
+
+    def _graph_safe_compute_loss(s_out, t_out, hp_dict):
+        """Graph-friendly duplicate of compute_loss (line 229) — no .item().
+
+        Returns (loss_tensor, l_cos_tensor) as CUDA tensors.
+        """
+        s = s_out.float()
+        t = t_out.detach().float()
+        cos_per = F.cosine_similarity(s.flatten(0, 1), t.flatten(0, 1),
+                                      dim=-1, eps=1e-4)
+        l_cos = (1 - cos_per).mean()
+        w = normalize_weights(hp_dict.get("loss_weights",
+                                          {"cos": 0.5, "mse": 0.5}))
+        loss_type = hp_dict.get("loss_type", "1-cos+norm_mse")
+        if loss_type == "1-cos":
+            loss = l_cos
+        elif loss_type == "1-cos+norm_mse":
+            t_var = (t * t).mean().clamp(min=1e-6)
+            l_mse = ((s - t) ** 2).mean() / t_var
+            loss = w["cos"] * l_cos + w["mse"] * l_mse
+        elif loss_type == "norm_mse":
+            t_var = (t * t).mean().clamp(min=1e-6)
+            loss = ((s - t) ** 2).mean() / t_var
+        else:
+            loss = l_cos
+        return loss, l_cos
+
+    def _graph_safe_clip_grad_norm_(params, max_norm):
+        """Graph-friendly clip_grad_norm_ — no .item() sync.
+
+        Equivalent to torch.nn.utils.clip_grad_norm_ but ALWAYS multiplies
+        by min(1.0, max_norm / (total_norm + eps)) — no `if clip_coef < 1:`
+        branch (which would read clip_coef via .item() and abort capture).
+
+        Returns the total_norm tensor (caller may .item() after replay).
+        """
+        grads = [p.grad.detach() for p in params if p.grad is not None]
+        if not grads:
+            return torch.zeros((), dtype=torch.float32, device=DEVICE)
+        norms = torch.stack([torch.norm(g, 2) for g in grads])
+        total_norm = torch.norm(norms, 2)
+        clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+        for p in params:
+            if p.grad is not None:
+                p.grad.detach().mul_(clip_coef)
+        return total_norm
+
+    def _capture_step_graphs(buf_idx, current_tau, current_hp_sig, current_step):
+        """Capture teacher_graph[buf_idx] + student_graph[buf_idx].
+
+        The capture itself EXECUTES the current step (PyTorch CUDA Graphs
+        replay during capture), so the captured step is not wasted.
+
+        Pre-conditions (caller MUST ensure):
+          - static_batch_ids has been populated with current batch_ids
+          - student is in train() mode (eval() mode would freeze dropout
+            patterns and break the captured autograd graph)
+          - HP / LR / tau have been applied to the model + optimizers
+            (the captured graph bakes in the current LR + tau values)
+
+        Captured graphs (Patch 21 + Patch 22):
+          teacher_graph[buf_idx] (on stream_t):
+            teacher.model.embed_tokens(static_batch_ids) + teacher layers
+            → h_out_buf[buf_idx].copy_(h.detach()) → event_t[buf_idx].record()
+          student_graph[buf_idx] (on default stream):
+            wait_event(event_t[buf_idx])    # Patch 22 sync
+            student.model.embed_tokens(static_batch_ids) + student layers
+            → _graph_safe_compute_loss(student_out, h_out_buf[buf_idx], hp)
+            → static_loss[buf_idx].copy_(loss.detach())
+            → static_l_cos[buf_idx].copy_(l_cos.detach())
+            → event_s[buf_idx].record()     # Patch 22 sync (invariant 3)
+            → loss.backward()
+            → _graph_safe_clip_grad_norm_ (per-group, ±1.0 / hp["gradient_clip"])
+            → opt_muon/opt_adamw/opt_indices.step()
+            → index_logits.clamp_(-5*tau, 5*tau)
+            → opt_*.zero_grad(set_to_none=True)
+
+        NOT captured (run eagerly after replay):
+          - LR scheduler.step()  (pure Python; doesn't run during replay)
+          - NaN check           (forces .item() sync)
+          - Eval / save         (rare; would invalidate the captured graph)
+          - Logging             (forces .item() syncs on grad_norms etc.)
+        """
+        # Ensure h_out_buf[buf_idx] is allocated (first capture for this buf).
+        # Run a tiny no-grad dummy forward to learn the output shape.
+        if h_out_buf[buf_idx] is None:
+            with torch.no_grad():
+                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                    _h = teacher.model.embed_tokens(static_batch_ids)
+                    _pos_ids = torch.arange(static_batch_ids.shape[1],
+                                            device=DEVICE).unsqueeze(0)
+                    _pos_emb = None
+                    if hasattr(teacher.model, 'rotary_emb') and teacher.model.rotary_emb is not None:
+                        _pos_emb = teacher.model.rotary_emb(_h, _pos_ids)
+                    for _li in range(sb_end):
+                        if _li < len(teacher.model.layers):
+                            _layer = teacher.model.layers[_li]
+                            if _pos_emb is not None:
+                                _out = _layer(_h, position_embeddings=_pos_emb)
+                            else:
+                                _out = _layer(_h)
+                            _h = _out[0] if isinstance(_out, tuple) else _out
+            h_out_buf[buf_idx] = torch.empty_like(_h.detach())
+
+        # === Capture teacher_graph[buf_idx] on stream_t (Patch 22) ===
+        teacher_graph[buf_idx] = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(teacher_graph[buf_idx], stream=stream_t):
+            with torch.no_grad():
+                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                    h = teacher.model.embed_tokens(static_batch_ids)
+                    position_ids = torch.arange(static_batch_ids.shape[1],
+                                                device=DEVICE).unsqueeze(0)
+                    if hasattr(teacher.model, 'rotary_emb') and teacher.model.rotary_emb is not None:
+                        pos_emb = teacher.model.rotary_emb(h, position_ids)
+                    else:
+                        pos_emb = None
+                    for layer_idx in range(sb_end):
+                        if layer_idx < len(teacher.model.layers):
+                            layer = teacher.model.layers[layer_idx]
+                            if pos_emb is not None:
+                                out = layer(h, position_embeddings=pos_emb)
+                            else:
+                                out = layer(h)
+                            h = out[0] if isinstance(out, tuple) else out
+                    h_out_buf[buf_idx].copy_(h.detach())
+            # Patch 22 invariant 1: signal teacher forward done writing
+            event_t[buf_idx].record(stream_t)
+
+        # === Capture student_graph[buf_idx] on default stream (Patch 21) ===
+        student_graph[buf_idx] = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(student_graph[buf_idx],
+                              stream=torch.cuda.current_stream()):
+            # Patch 22 invariant 2: wait for teacher before reading h_out_buf
+            torch.cuda.current_stream().wait_event(event_t[buf_idx])
+
+            s_h = student.model.embed_tokens(static_batch_ids)
+            with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                position_ids = torch.arange(static_batch_ids.shape[1],
+                                            device=DEVICE).unsqueeze(0)
+                if hasattr(student.model, 'rotary_emb') and student.model.rotary_emb is not None:
+                    s_pos_emb = student.model.rotary_emb(s_h, position_ids)
+                else:
+                    s_pos_emb = None
+                for layer_idx in range(sb_end + 1):  # +1 for correction layer
+                    if layer_idx < len(student.model.layers):
+                        layer = student.model.layers[layer_idx]
+                        if s_pos_emb is not None:
+                            out = layer(s_h, position_embeddings=s_pos_emb)
+                        else:
+                            out = layer(s_h)
+                        s_h = out[0] if isinstance(out, tuple) else out
+                student_out = s_h
+
+            # Graph-friendly loss (no .item() inside graph)
+            loss, l_cos = _graph_safe_compute_loss(
+                student_out, h_out_buf[buf_idx], hp)
+            # Save loss tensors to static buffers for post-replay .item() read
+            static_loss[buf_idx].copy_(loss.detach())
+            static_l_cos[buf_idx].copy_(l_cos.detach())
+
+            # Patch 22 invariant 3: signal student done READING h_out_buf
+            # IMMEDIATELY after compute_loss, BEFORE backward(). The student
+            # only needs h_out_buf for the loss — recording event_s now lets
+            # the NEXT iter's teacher start writing to h_out_buf[1-buf_idx] as
+            # soon as compute_loss finishes (overlapping with this iter's bwd).
+            event_s[buf_idx].record(torch.cuda.current_stream())
+
+            # Backward (captured — autograd graph is built during capture)
+            loss.backward()
+
+            # Two-tier clip (graph-friendly; no .item() inside graph).
+            # Mirrors the eager-path split: indices clipped at 1.0, others
+            # at hp["gradient_clip"] (default 0.3).
+            indices_params_g = [p for _n, p in student.named_parameters()
+                                if p.grad is not None and "index_logits" in _n]
+            other_params_g   = [p for _n, p in student.named_parameters()
+                                if p.grad is not None and "index_logits" not in _n]
+            if indices_params_g:
+                _graph_safe_clip_grad_norm_(indices_params_g, 1.0)
+            if other_params_g:
+                _graph_safe_clip_grad_norm_(other_params_g,
+                                            hp.get("gradient_clip", 0.3))
+
+            # Optimizer steps. LR is baked in at capture time; the next
+            # re-capture picks up LR scheduler updates.
+            if opt_muon:    opt_muon.step()
+            if opt_adamw:   opt_adamw.step()
+            if opt_indices: opt_indices.step()
+
+            # Adaptive clamp on index_logits (±5τ — same as eager path).
+            # current_tau is the tau value baked into this capture.
+            if opt_indices:
+                with torch.no_grad():
+                    for _name, par in student.named_parameters():
+                        if "index_logits" in _name:
+                            par.data.clamp_(-5.0 * current_tau, 5.0 * current_tau)
+
+            # zero_grad INSIDE the graph so grads are clean for next replay.
+            if opt_muon:    opt_muon.zero_grad(set_to_none=True)
+            if opt_adamw:   opt_adamw.zero_grad(set_to_none=True)
+            if opt_indices: opt_indices.zero_grad(set_to_none=True)
+
+        last_capture_step[buf_idx]    = current_step
+        last_capture_hp_sig[buf_idx]  = current_hp_sig
+
+    def _replay_step_graphs(buf_idx):
+        """Replay teacher_graph[buf_idx] + student_graph[buf_idx].
+
+        Pre-conditions:
+          - static_batch_ids has been populated with current batch_ids
+          - Both graphs were previously captured for this buf_idx
+        Returns: (loss_val, l_cos_val) as Python floats (post-sync).
+        """
+        # Patch 22: teacher graph runs on stream_t, records event_t
+        teacher_graph[buf_idx].replay()
+        # Patch 21: student graph runs on default stream, waits for event_t,
+        # does fwd + loss + bwd + clip + opt + zero_grad, records event_s
+        student_graph[buf_idx].replay()
+        # Sync to make static_loss readable via .item()
+        torch.cuda.synchronize()
+        return static_loss[buf_idx].item(), static_l_cos[buf_idx].item()
+
+    def _cuda_graph_eligible(step_val, hp_val, global_step_val, save_every_val):
+        """Decide if the current step is eligible for CUDA Graph replay.
+
+        NOT eligible when:
+          - A previous capture/replay failed (graph_capture_failed=True)
+          - Still in warmup (step < CUDA_GRAPH_WARMUP_STEPS)
+          - Eval step (eval calls student.eval() — invalidates train-mode graph)
+          - Save step (save is rare; just run eager to keep code simple)
+        """
+        if graph_capture_failed:
+            return False
+        if step_val < CUDA_GRAPH_WARMUP_STEPS:
+            return False
+        eval_every = hp_val.get("eval_every", 250)
+        if global_step_val > 0 and global_step_val % eval_every == 0:
+            return False
+        if global_step_val > 0 and global_step_val % save_every_val == 0:
+            return False
+        return True
+
+    def _cuda_graph_needs_recapture(buf_idx, step_val, current_hp_sig):
+        """Decide if the captured graph needs to be re-captured for this buf.
+
+        Re-capture when:
+          - Never captured (last_capture_step[buf_idx] < 0)
+          - Periodic re-capture (step - last_capture_step >= RECAPTURE_INTERVAL)
+            picks up LR scheduler changes (LR is baked into the captured kernel)
+          - HP signature changed (live JSON update — forces immediate re-capture)
+          - Also: previous NaN recovery (last_capture_step reset to -1)
+        """
+        if last_capture_step[buf_idx] < 0:
+            return True
+        if (step_val - last_capture_step[buf_idx]) >= CUDA_GRAPH_RECAPTURE_INTERVAL:
+            return True
+        if last_capture_hp_sig[buf_idx] != current_hp_sig:
+            return True
+        return False
+
     # ─── Epilogue / StopIteration handling (Round 1 fix) ────────────────────
     # The for-loop's iteration protocol catches StopIteration automatically
     # when data_stream is exhausted (n_seqs reached at line 918's generator).
@@ -1206,6 +1538,124 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
                            opt_indices=opt_indices, sched_indices=sched_indices)
                 last_hp_sig = ns
             last_hp_check = global_step
+
+        # ─── [Patch 21 + 22, Wave 4] CUDA Graph step (capture or replay) ───
+        # Research: research-kernel-efficiency/08_recommendations.md §11
+        #           research-kernel-efficiency/06_stream_overlap.md §6
+        #
+        # If the current step is eligible for CUDA Graph replay (past warmup,
+        # not an eval/save step, no prior capture failure), execute the full
+        # training step via the captured graphs and continue. Falls back to
+        # the eager path (below) on capture/replay failure or when conditions
+        # aren't met.
+        #
+        # The graph path captures: teacher fwd (stream_t) + student fwd + loss
+        # + bwd + clip + opt + zero_grad (default stream), with event-based
+        # sync between the two graphs (Patch 22). The eager path (below) is
+        # the original Patch 6 stream double-buffer + existing training step,
+        # preserved verbatim as the fallback.
+        save_every = hp.get("save_every", 2000)
+        current_hp_sig = json.dumps(hp, sort_keys=True)
+        if _cuda_graph_eligible(step, hp, global_step, save_every):
+            try:
+                # Populate static input buffer (invariant: shapes fixed at
+                # capture time — batch_size × seq_len torch.long).
+                static_batch_ids.copy_(batch_ids)
+
+                if _cuda_graph_needs_recapture(buf_idx, step, current_hp_sig):
+                    # Capture path — executes the step AND captures the graph.
+                    # tau + LR + HP are baked into the captured kernels.
+                    _capture_step_graphs(buf_idx, tau, current_hp_sig, step)
+                    # The capture itself executes the step (PyTorch CUDA Graphs
+                    # replay during capture). Sync to make static_loss readable.
+                    torch.cuda.synchronize()
+                    loss_val = static_loss[buf_idx].item()
+                    l_cos_val = static_l_cos[buf_idx].item()
+                else:
+                    # Replay path — single CPU dispatch replays ~500 captured
+                    # kernels back-to-back, no per-kernel launch overhead.
+                    loss_val, l_cos_val = _replay_step_graphs(buf_idx)
+
+                # NaN check (post-replay, OUTSIDE the graph — .item() syncs).
+                # This is the data-dependent control flow that MUST stay outside
+                # the captured region (per 08_recommendations.md §11 req. 3).
+                if not math.isfinite(loss_val):
+                    n_nan_skip += 1
+                    print(f"  [step {global_step}] NaN loss (graph replay) — skipping", flush=True)
+                    # Force re-capture on next step (grads were zeroed inside
+                    # the captured graph; state is dirty).
+                    last_capture_step[buf_idx] = -1
+                    global_step += 1  # advance to avoid infinite loop on persistent NaN
+                    buf_idx = 1 - buf_idx
+                    continue
+
+                # LR scheduler step (eager — NOT captured in graph because
+                # sched_*.step() is pure Python that doesn't run during replay).
+                # The updated LR takes effect on the NEXT re-capture (when the
+                # optimizer kernel is re-baked with the new LR value).
+                if sched_muon:    sched_muon.step()
+                if sched_adamw:   sched_adamw.step()
+                if sched_indices: sched_indices.step()
+
+                global_step += 1
+
+                # Logging (every log_every steps). grad_norms are not available
+                # in graph mode (clip happens inside the captured graph) — log
+                # "(graph)" instead. Loss/cos come from the static buffers.
+                if global_step % hp.get("log_every", 50) == 0:
+                    cos_val = 1.0 - l_cos_val
+                    elapsed = max(1e-6, time.time() - start_time)
+                    tps = (global_step - resume_step) / elapsed
+                    # Per-group LRs (unique)
+                    group_lrs = {}
+                    for opt in (opt_muon, opt_adamw, opt_indices):
+                        if opt is None: continue
+                        for g in opt.param_groups:
+                            grp = g.get("group", "?")
+                            if grp not in group_lrs:
+                                group_lrs[grp] = g["lr"]
+                    lrs_str = " ".join(f"{k}={v:.1e}" for k, v in sorted(group_lrs.items()))
+                    tau_str = f"tau={tau:.3f}" if use_soft_indices else ""
+                    try:
+                        gpu_mem_alloc = torch.cuda.memory_allocated() / (1024**3)
+                        gpu_mem_reserved = torch.cuda.memory_reserved() / (1024**3)
+                        gpu_util = torch.cuda.utilization()
+                        gpu_str = f" GPU[{gpu_mem_alloc:.1f}/{gpu_mem_reserved:.1f}G util={gpu_util}%]"
+                    except Exception:
+                        gpu_str = ""
+                    print(f"  step={global_step:5d} loss={loss_val:.4f} cos={cos_val:.4f} tps={tps:.1f} {tau_str}{gpu_str} gn=[(graph)] [{lrs_str}]", flush=True)
+
+                # Eval + save (same logic as eager path — evaluate() switches
+                # student to eval mode then back to train mode at line ~465).
+                # After eval, we force a re-capture on the next eligible step
+                # (autograd state may have shifted).
+                if global_step % hp.get("eval_every", 250) == 0:
+                    eval_result = evaluate(student, teacher, eval_tokens, sb_idx, hp, max_batches=8)
+                    eval_cos = eval_result["cos"]
+                    print(f"  [EVAL] step={global_step} cos={eval_cos:.6f} loss={eval_result['loss']:.6f} ({eval_result['n_seqs']} held-out seqs)", flush=True)
+                    if eval_cos > best_cos and eval_cos > 0:
+                        best_cos = eval_cos
+                        best_step = global_step
+                        best_loss = eval_result['loss']
+                        print(f"  ★ NEW BEST (eval): step={best_step} cos={best_cos:.6f}", flush=True)
+                        if global_step % save_every == 0 or global_step >= max_steps:
+                            out_dir = os.path.join(TRAINED_BASE, f"superblock_{sb_idx}_best")
+                            save_state(student, sb_idx, best_step, best_cos, best_loss, out_dir)
+                        else:
+                            print(f"    (deferred save — next save at step {((global_step // save_every) + 1) * save_every})", flush=True)
+                    # Force re-capture on both buffers (eval briefly switched
+                    # student to eval mode — even though student.train() was
+                    # called inside evaluate(), be safe and re-capture).
+                    last_capture_step[0] = -1
+                    last_capture_step[1] = -1
+
+                del batch_ids
+                buf_idx = 1 - buf_idx  # Patch 6: ping-pong to next buffer
+                continue  # Skip the eager path for this step
+            except Exception as e:
+                print(f"  [step {global_step}] CUDA Graph failed: {e}; falling back to eager", flush=True)
+                graph_capture_failed = True
+                # Fall through to eager path below
 
         # === TEACHER FORWARD on stream_t, writes to h_out_buf[buf_idx] ===
         # Patch 6 (Wave 2): persistent stream_t + double-buffered h_out_buf.
