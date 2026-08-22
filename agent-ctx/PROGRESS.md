@@ -9,7 +9,7 @@
 | Agent | Branch | Wave 1 | Wave 2 | Wave 3 | Merged |
 |-------|--------|--------|--------|--------|--------|
 | nn-module-foundation | `agent/nn-module-foundation` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| training-recipe | `agent/training-recipe` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
+| training-recipe | `agent/training-recipe` | ✅ Done | 🔄 In Progress | ⬜ Pending | ⬜ |
 | kernels | `agent/kernels` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | optimizer-streams | `agent/optimizer-streams` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 
@@ -32,7 +32,7 @@
 |---|-------|-------|--------|--------|--------|
 | 9 | PartialWrapper → nn.Module | nn-module-foundation | ⬜ | — | — |
 | 2 | LoftQ SVD init for LoRA | nn-module-foundation | ⬜ | — | — |
-| 1 | Polynomial τ schedule (floor 0.5) | training-recipe | ⬜ | — | — |
+| 1 | Polynomial τ schedule (floor 0.5) | training-recipe | ✅ | `agent/training-recipe` | `012e820` |
 | 3 | Adaptive logit clamp ±5τ | training-recipe | ⬜ | — | — |
 | 4 | Group size 256→128 | training-recipe | ⬜ | — | — |
 | 5 | Fused bwd with AoS P layout | kernels | ⬜ | — | — |
@@ -47,6 +47,9 @@
 | Timestamp | Agent | Event |
 |-----------|-------|-------|
 | 2025-08-22T12:00:00Z | orchestrator | Created agent-ctx infrastructure + 4 branches |
+| 2026-08-22T08:30:00Z | training-recipe | Wave 1 / Patch 1a: tau CLI defaults updated (tau_final 0.1->0.5, tau_anneal_steps 4000->6000). Commit `957ad62`. |
+| 2026-08-22T08:35:00Z | training-recipe | Wave 1 / Patch 1b: linear tau anneal replaced with piecewise warmup (500 steps) + quadratic decay (6000 steps) + hold at 0.5. Commit `012e820`. Syntax check + math sim both pass. |
+| 2026-08-22T08:36:00Z | training-recipe | Wave 1 complete. Pushed to origin/agent/training-recipe. Sent inbox message to nn-module-foundation (informational — no conflicts). |
 
 ---
 
@@ -54,7 +57,7 @@
 
 | Agent | Last Message | From | Subject | Action Required |
 |-------|--------------|------|---------|-----------------|
-| nn-module-foundation | — | — | — | — |
+| nn-module-foundation | 2026-08-22T08:36Z | training-recipe | Patch 1 (τ schedule) done on agent/training-recipe | nothing |
 | training-recipe | — | — | — | — |
 | kernels | — | — | — | — |
 | optimizer-streams | — | — | — | — |
