@@ -1,0 +1,14 @@
+# qwen-palettize runtime dependencies
+#
+# Install with: pip install -r requirements.txt
+#
+# Python 3.10+, PyTorch 2.x stable assumed pre-installed (CUDA build matching the
+# target GPU driver). The packages below are the project-specific additions.
+
+# Patch 8 — Fused AdamW for index_logits
+# Replaces FP32MasterAdamW (113ms/step, 21.4GB VRAM) with bitsandbytes 8-bit AdamW
+# (20ms/step, 3.56GB VRAM). 8-bit state (m, v) handles fp16 index_logits natively
+# without an fp32 master copy. See research-filter-consolidation/03_optimizer_speedup.md
+# §Patch 8 (Option B) and docs/papers/1412.6980_Adam_Kingma2015.pdf +
+# docs/papers/1711.05101_AdamW_Loshchilov2019.pdf.
+bitsandbytes>=0.43.0
