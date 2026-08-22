@@ -64,3 +64,27 @@ Stage Summary:
 - Branch is NOT rebased on origin/main (no new commits to main since clone; no nn.Module changes to pull).
 - Wave 3 will: (9a) verify no NaN with 8-bit AdamW + eps fallback ready, (9b) merge origin/main (no conflicts expected since main hasn't moved), (9c) final PROGRESS update.
 
+
+---
+Task ID: 4-wave3
+Agent: optimizer-streams
+Task: Wave 3 — Final Verification + Merge Prep. DoD: no NaN with 8-bit AdamW (or eps raised to 1e-6), branch merges cleanly with main, PROGRESS.md fully updated, branch pushed.
+
+Work Log:
+- Checked inbox at start of Wave 3 — empty (no RELEASED from nn-module-foundation; their inbox also empty). origin/main unchanged at 8770547. Decided to proceed without rebase since main hasn't moved.
+- Sub-task 9a: cannot run training (no training server access per orchestrator rules). Took the defensive DoD-sanctioned alternative — raised bnb.optim.AdamW8bit eps from 1e-8 to 1e-6 in build_optimizers (line ~613). Rationale: 8-bit quantized state has ~1/256 dequantization noise; the original FP32MasterAdamW had a CRITICAL warning about eps=1e-8+fp16 state causing NaN; 1e-6 is bitsandbytes' recommended floor for 8-bit state. Existing safety nets preserved: skip-and-continue at line ~1161 + clamp_(-20, 20) at line ~1209 (training-recipe's Patch 3 will tighten this to ±5τ). Syntax check OK. Commit 02cff8e.
+- Sub-task 9b: `git fetch origin main` — no new commits. `git merge origin/main --no-edit` → "Already up to date" (no conflicts, no rebase needed). Verified file ownership respected: only files in my territory modified (scripts/train_qwen.py lines 540-600 + 975 + training loop 1058-1103 area + 1128 + 1209 for ping-pong, requirements.txt new, PROGRESS.md, worklog.md, training-recipe inbox). Untouched: qwen_model.py, fused_lut_kernel.cu, fused_lut_linear_cuda.py, palettize_core.py, train_qwen.py lines 632-736 (nn-module) + 1034-1040 (τ) + 1140-1160 (clamp).
+- Sub-task 9c: updated PROGRESS.md — Wave 3 ✅, Patch 8 commit updated to 02cff8e (eps=1e-6), event log entry for Wave 3 completion added. Branch ready for merge to main.
+
+Stage Summary:
+- Wave 3 DoD fully met:
+  [x] No NaN with 8-bit AdamW → defensive eps=1e-6 fallback applied (DoD alternative)
+  [x] Branch merges cleanly with main → "Already up to date" (no conflicts)
+  [x] PROGRESS.md fully updated → Wave 3 ✅, all patches ✅, event log complete
+  [x] Branch pushed → agent/optimizer-streams @ 1c03465
+- All 3 waves complete:
+  - Wave 1 (Patch 8): commits cd50c41 + 6decbbd + 8c72021 + d1692c1
+  - Wave 2 (Patch 6): commits e778f56 + a2576f5 + 8254bf1
+  - Wave 3 (9a/9b/9c): commits 02cff8e + 1c03465 + final PROGRESS commit
+- Branch ready for orchestrator merge to main (merge order: optimizer-streams LAST, after nn-module-foundation + training-recipe + kernels).
+
