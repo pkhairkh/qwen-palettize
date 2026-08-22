@@ -908,15 +908,70 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         grad_logits = None
         grad_palette = None
         if needs_grad_logits or needs_grad_palette:
-            mod = _get_module()
-            grad_logits, grad_palette = mod.fused_lut_linear_soft_bwd_fused_aos(
-                grad_y, x, P_aos, palette, GS
-            )
-            # Optional env-var escape hatch for benchmarking against the legacy
-            # zero-grad path (the indices at very low τ converge to one-hot and
-            # the gradient is ~0, so skipping is a valid optimisation in some runs).
-            if needs_grad_logits and os.environ.get("SKIP_ZERO_GRAD_LOGITS", "0") == "1":
-                grad_logits = torch.zeros_like(logits)
+            # Round-1 fix (Issue 1): the fused AoS backward kernel
+            # (`fused_lut_linear_soft_bwd_fused_aos`) is structurally sound
+            # and reviewed, but it has NOT yet been validated on a GPU
+            # (test_fused_bwd_aos.py:TestCudaEndToEnd requires a CUDA host).
+            # If a subtle indexing bug slips through, training will produce
+            # NaN gradients. Provide a safe Python fallback that is bit-for-bit
+            # equivalent to the PHASE IX.c reference path, gated by the
+            # SKIP_FUSED_BWD env var so operators can flip back to the
+            # known-correct path without code changes:
+            #   SKIP_FUSED_BWD=1   →  use PyTorch elementwise (slower, known-correct)
+            #   SKIP_FUSED_BWD=0   →  use fused AoS CUDA kernel (default, faster)
+            use_python_fallback = os.environ.get("SKIP_FUSED_BWD", "0") == "1"
+
+            if use_python_fallback:
+                # ── Python elementwise fallback (PHASE IX.c formulas, AoS P layout) ──
+                # P_aos is (K, N, 4) fp16 — already AoS, no permute needed.
+                # grad_W = x.T @ grad_y  (cuBLAS, bf16)
+                grad_W = torch.matmul(x.T, grad_y)  # (K, N) bf16
+
+                # Shared constants: g_idx[o] = o // GS ; pal_per_col[o] = palette[g_idx[o]]
+                g_idx = torch.arange(N, device=x.device) // GS
+                pal_per_col = palette[g_idx.long()].float()  # (N, 4) fp32
+
+                if needs_grad_palette:
+                    # grad_palette[g, k] = Σ_{j, o in group g} grad_W[j, o] * P_aos[j, o, k]
+                    # Use fp16 contributions (autocast handles bf16 × fp16 → fp16)
+                    # to avoid materialising a (K, N, 4) fp32 intermediate.
+                    P_kno = P_aos  # (K, N, 4) fp16 — already in the right layout
+                    contributions = (grad_W.unsqueeze(-1) * P_kno).view(K, G, GS, 4)
+                    grad_palette = contributions.sum(dim=(0, 2)).to(torch.bfloat16)
+
+                if needs_grad_logits:
+                    # grad_logits[k, j, o] = grad_W[j, o] * P[j, o, k] * (palette[g, k] - W[j, o])
+                    # where W[j, o] = Σ_k P[j, o, k] * palette[g, k]  (re-derived from P_aos)
+                    grad_W_f = grad_W.float()                 # (K, N) fp32
+                    P_kno_f = P_aos.float()                   # (K, N, 4) fp32
+                    pal_per_col_k = pal_per_col.unsqueeze(0).expand(K, N, 4)  # (K, N, 4)
+                    W_val = (P_kno_f * pal_per_col_k).sum(dim=-1)               # (K, N)
+                    gl_kno = (
+                        grad_W_f.unsqueeze(-1)
+                        * P_kno_f
+                        * (pal_per_col_k - W_val.unsqueeze(-1))
+                    )  # (K, N, 4) fp32
+                    # Output SoA (4, K, N) fp16 to match the autograd contract
+                    grad_logits = gl_kno.to(torch.float16).permute(2, 0, 1).contiguous()
+
+                    # SKIP_ZERO_GRAD_LOGITS is preserved (legacy benchmarking
+                    # escape hatch — at very low τ the indices converge to one-hot
+                    # and grad is ~0, so skipping is a valid optimisation in some runs).
+                    if os.environ.get("SKIP_ZERO_GRAD_LOGITS", "0") == "1":
+                        grad_logits = torch.zeros_like(logits)
+            else:
+                # ── Fused AoS CUDA backward kernel (default — Patch 5c) ──
+                # grad_W is computed INSIDE the kernel (on-the-fly per thread),
+                # so we don't materialise the (K, N) bf16 grad_W on the Python side.
+                mod = _get_module()
+                grad_logits, grad_palette = mod.fused_lut_linear_soft_bwd_fused_aos(
+                    grad_y, x, P_aos, palette, GS
+                )
+                # SKIP_ZERO_GRAD_LOGITS env-var escape hatch (kept for parity with
+                # the fallback path — applies to the fused-kernel output too).
+                if needs_grad_logits and os.environ.get("SKIP_ZERO_GRAD_LOGITS", "0") == "1":
+                    grad_logits = torch.zeros_like(logits)
+
             if not needs_grad_logits:
                 grad_logits = None
             if not needs_grad_palette:

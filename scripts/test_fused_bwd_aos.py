@@ -202,6 +202,22 @@ class TestModuleSymbols(unittest.TestCase):
         # But the SKIP_ZERO_GRAD_LOGITS env-var escape hatch is preserved.
         self.assertIn("SKIP_ZERO_GRAD_LOGITS", src)
 
+    def test_backward_has_skip_fused_bwd_fallback(self):
+        """Round-1 fix: a SKIP_FUSED_BWD=1 env-var fallback to the Python
+        elementwise path MUST be present, so operators can switch back to a
+        known-correct path if the fused kernel produces NaN on a real GPU.
+        """
+        py_path = os.path.join(HERE, "fused_lut_linear_cuda.py")
+        with open(py_path) as f:
+            src = f.read()
+        self.assertIn("SKIP_FUSED_BWD", src,
+                      "SKIP_FUSED_BWD env-var fallback must be present in backward")
+        # The fallback must call torch.matmul(x.T, grad_y) (grad_W reference)
+        # and must produce grad_logits in (4, K, N) SoA layout (matches the
+        # autograd contract for the SoA logits parameter).
+        self.assertIn("use_python_fallback", src)
+        self.assertIn("grad_W = torch.matmul(x.T, grad_y)", src)
+
     def test_forward_calls_aos_kernel(self):
         """CUDAFusedLUTLinearSoft.forward must call the AoS soft forward."""
         py_path = os.path.join(HERE, "fused_lut_linear_cuda.py")
