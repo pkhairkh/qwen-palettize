@@ -693,6 +693,25 @@ def build_student_super_block(sb_idx, lora_rank=16, lora_alpha=32, use_soft_indi
                 n_palettized += 1
     print(f"  Palettized {n_palettized} Linears to 2-bit (soft_indices={use_soft_indices})", flush=True)
 
+    # Capture original fp16 weights from the HF checkpoint for LoftQ SVD init.
+    # Patch 2 (LoftQ): QwenLoRA init="loftq" needs the ORIGINAL pre-palettization
+    # weight to compute R = W_orig - W_quantized and take its SVD. Previously
+    # this was passed as None, causing QwenLoRA to fall back to zero-init B
+    # (qwen_model.py:223-225), wasting the first ~1000 steps climbing out of
+    # the zero-init valley. See docs/papers/2305.14314_QLoRA_Dettmers2023.pdf §3.2.
+    #
+    # We capture from the HF checkpoint (not from the loaded wrapper) because
+    # the wrapper's nn.Linear modules have already been replaced by
+    # PalettizedLinear above — the original weights are gone from `model`.
+    # The checkpoint is the only source of truth for pre-palettization weights.
+    #
+    # Weights are placed on DEVICE (= "cuda") explicitly so the SVD inside
+    # QwenLoRA.__init__ (qwen_model.py:217-222) runs on-GPU directly without
+    # a host→device copy per-tensor. This matches the function default but is
+    # passed explicitly for clarity at the call site.
+    from qwen_model import capture_original_weights_from_checkpoint
+    original_weights = capture_original_weights_from_checkpoint(sb_idx, device=DEVICE)
+
     # Attach LoRA on ALL palettized Linears.
     # Use rank-32 for the 5 worst-cosine Linears (from calib_sb0.log),
     # rank-16 for the rest. These 5 had cos < 0.93 after calibration.
@@ -715,7 +734,16 @@ def build_student_super_block(sb_idx, lora_rank=16, lora_alpha=32, use_soft_indi
                 is_big = (layer_idx, name) in BIG_LORA_TARGETS
                 rank = BIG_LORA_RANK if is_big else lora_rank
                 alpha = BIG_LORA_ALPHA if is_big else lora_alpha
-                lora_mod = QwenLoRA(module, rank=rank, alpha=alpha, init="loftq", original_weight=None)
+                # Look up the original pre-palettization weight for LoftQ SVD init.
+                # full_name format matches capture_original_weights_from_checkpoint keys:
+                #   "model.layers.{idx}.{submodule.path}.weight"
+                full_name = f"model.layers.{layer_idx}.{name}.weight"
+                orig_w = original_weights.get(full_name)
+                if orig_w is None:
+                    # Should not happen — every palettized Linear has a corresponding
+                    # original weight. Log and fall back to zero-init if it does.
+                    print(f"    WARNING: no original weight for {full_name} — LoRA falls back to zero-init", flush=True)
+                lora_mod = QwenLoRA(module, rank=rank, alpha=alpha, init="loftq", original_weight=orig_w)
                 parent = layer
                 parts = name.split(".")
                 for p in parts[:-1]:
@@ -724,11 +752,22 @@ def build_student_super_block(sb_idx, lora_rank=16, lora_alpha=32, use_soft_indi
                 total_lora += 1
     print(f"  Attached LoRA (rank-{lora_rank} + rank-{BIG_LORA_RANK} on 5 worst-cos) to {total_lora} Linears across {sb_end - sb_start} layers", flush=True)
 
+    # Free the original weights — they're no longer needed after LoRA init.
+    # QwenLoRA has already consumed them for SVD; keeping them would waste
+    # ~1-2 GB of CPU RAM for the rest of build_student_super_block.
+    del original_weights
+    import gc as _gc
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Cast to dtype
     model.to(DTYPE)
     # Restore index_logits to fp16 (model.to(bf16) converts them to bf16,
     # but the soft CUDA kernel requires fp16 logits)
-    # PartialWrapper is not nn.Module — iterate its layers manually
+    # PartialWrapper is now an nn.Module (Patch 9), so model.apply() would
+    # work, but we keep the explicit layer loop for parity with the training
+    # loop's streaming forward pattern (which calls layers directly).
     for layer in model.model.layers:
         for submod in layer.modules():
             if isinstance(submod, PalettizedLinear) and submod.index_logits is not None:

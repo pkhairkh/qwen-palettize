@@ -431,6 +431,107 @@ def load_qwen_model(model_name="Qwen/Qwen3.5-4B", device="cuda", dtype=torch.bfl
     return model, tokenizer
 
 
+# ─── PartialModel / PartialWrapper (nn.Module subclasses) ────────────────
+# These were previously nested inside load_qwen_super_block_only as plain
+# Python classes with hand-rolled to/eval/train/parameters/named_parameters/
+# named_modules/get_submodule. Converting them to nn.Module unlocks
+# torch.compile, torch.utils.checkpoint, state_dict/load_state_dict, FSDP,
+# accelerate, transformers.Trainer, register_forward_hook, requires_grad_,
+# apply, and ~50 other nn.Module API methods. See research-architecture-
+# review/02_partial_wrapper_problem.md for the full diagnosis.
+class PartialModel(nn.Module):
+    """Prefix of Qwen3.5: embed_tokens + rotary_emb + first N layers + optional norm.
+
+    All attributes are registered as submodules / parameters / buffers via
+    nn.Module.__setattr__, so parameters(), named_modules(), state_dict(),
+    to(), eval(), train(), apply(), etc. are inherited and correct.
+    """
+    def __init__(self, embed_tokens, rotary_emb, layers, norm=None, config=None):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        # rotary_emb is an nn.Module in HF Qwen (Qwen3_5RotaryEmbedding);
+        # may be None for architectures that fold RoPE into the layer.
+        self.rotary_emb = rotary_emb
+        # nn.ModuleList (was: plain Python list) so layers are registered in
+        # _modules and participate in state_dict / to / eval / train / apply.
+        self.layers = nn.ModuleList(layers)
+        self.norm = norm
+        # config is plain metadata (not a tensor / module); keep as attribute.
+        self.config = config
+
+    def forward(self, input_ids, position_ids=None):
+        """Run embed_tokens → rotary_emb → prefix layers → optional norm.
+
+        Mirrors the forward path previously inlined in train_qwen.py's
+        training loop (teacher.model.embed_tokens → teacher.model.layers[i]
+        → ...). The loop there still calls layers directly for streaming /
+        CUDA-stream overlap reasons; this forward() is provided so that
+        standard PyTorch subsystems (torch.compile, checkpoint, Trainer,
+        hooks) work out of the box.
+        """
+        h = self.embed_tokens(input_ids)
+        if position_ids is None:
+            position_ids = torch.arange(
+                input_ids.shape[1], device=input_ids.device
+            ).unsqueeze(0)
+        pos_emb = (
+            self.rotary_emb(h, position_ids)
+            if self.rotary_emb is not None
+            else None
+        )
+        for layer in self.layers:
+            out = (
+                layer(h, position_embeddings=pos_emb)
+                if pos_emb is not None
+                else layer(h)
+            )
+            h = out[0] if isinstance(out, tuple) else out
+        if self.norm is not None:
+            h = self.norm(h)
+        return h
+
+
+class PartialWrapper(nn.Module):
+    """Thin nn.Module wrapper around a PartialModel.
+
+    Exists so that downstream code can treat the student / teacher prefix
+    as a single nn.Module (for torch.compile, FSDP, accelerate, Trainer,
+    state_dict, etc.) while still allowing the training loop to reach into
+    `.model.embed_tokens` / `.model.layers[i]` for streaming / CUDA-stream
+    overlap. All nn.Module API methods (parameters, named_parameters,
+    named_modules, state_dict, load_state_dict, to, eval, train, apply,
+    requires_grad_, register_forward_hook, ...) are inherited.
+    """
+    def __init__(self, partial_model, config):
+        super().__init__()
+        # partial_model is a PartialModel (nn.Module) — registered as a
+        # submodule named "model", so wrapper.named_parameters() yields
+        # keys like "model.layers.0.linear_attn.out_proj.lora_A".
+        self.model = partial_model
+        # config is plain metadata (HF config object); kept as attribute.
+        self.config = config
+
+    def forward(self, input_ids, position_ids=None):
+        """Delegate to the wrapped PartialModel."""
+        return self.model(input_ids, position_ids)
+
+
+# NOTE on key naming: after the nn.Module refactor, wrapper.named_parameters()
+# and wrapper.named_modules() yield keys prefixed with "model." (e.g.
+# "model.layers.0.linear_attn.out_proj.lora_A"). The pre-refactor hand-rolled
+# generators yielded keys WITHOUT the "model." prefix (e.g.
+# "layers.0.linear_attn.out_proj.lora_A"). save_state / load_state in
+# train_qwen.py derive filenames from these keys via name.replace(".", "_"),
+# so legacy trained/superblock_N_best/*.pt files (named
+# "layers_0_linear_attn_out_proj_lora_A.pt") will NOT round-trip with the new
+# key naming. This is a known consequence of the nn.Module refactor (see
+# research-architecture-review/02_partial_wrapper_problem.md §9 Risk #1 and
+# §6.3 for the migration shim proposal). Checkpoint migration is out of scope
+# for Patch 9 and will be handled separately by the orchestrator. New
+# checkpoints saved after this refactor will use the "model." prefix
+# consistently and will round-trip correctly.
+
+
 def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
                                  device="cuda", dtype=torch.bfloat16):
     """Load embed_tokens + layers 0 to sb_end-1 using standard from_pretrained.
@@ -472,104 +573,10 @@ def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Build wrapper (same as before)
-    class PartialModel:
-        """Minimal model with embed_tokens + rotary_emb + prefix layers."""
-        def __init__(self, embed_tokens, rotary_emb, layers, norm=None, config=None):
-            self.embed_tokens = embed_tokens
-            self.rotary_emb = rotary_emb
-            self.layers = layers
-            self.norm = norm
-            self.config = config
-
-        def to(self, device):
-            self.embed_tokens = self.embed_tokens.to(device)
-            if self.rotary_emb is not None:
-                self.rotary_emb = self.rotary_emb.to(device)
-            self.layers = [l.to(device) for l in self.layers]
-            if self.norm is not None:
-                self.norm = self.norm.to(device)
-            return self
-
-        def eval(self):
-            self.embed_tokens.eval()
-            if self.rotary_emb is not None: self.rotary_emb.eval()
-            for l in self.layers: l.eval()
-            if self.norm is not None: self.norm.eval()
-            return self
-
-        def parameters(self):
-            for p in self.embed_tokens.parameters(): yield p
-            for l in self.layers:
-                for p in l.parameters(): yield p
-            if self.norm is not None:
-                for p in self.norm.parameters(): yield p
-
-        def named_modules(self):
-            yield ("embed_tokens", self.embed_tokens)
-            for i, layer in enumerate(self.layers):
-                for name, mod in layer.named_modules():
-                    if name:
-                        yield (f"layers.{i}.{name}", mod)
-                    else:
-                        yield (f"layers.{i}", layer)
-
-    class PartialWrapper:
-        def __init__(self, partial_model, config):
-            self.model = partial_model
-            self.config = config
-
-        def to(self, device):
-            self.model = self.model.to(device)
-            return self
-
-        def eval(self):
-            self.model.eval()
-            return self
-
-        def train(self, mode=True):
-            for l in self.model.layers: l.train(mode)
-            return self
-
-        def parameters(self):
-            for p in self.model.embed_tokens.parameters(): yield p
-            for layer in self.model.layers:
-                for p in layer.parameters(): yield p
-            if self.model.norm is not None:
-                for p in self.model.norm.parameters(): yield p
-
-        def named_parameters(self):
-            for name, p in self.model.embed_tokens.named_parameters():
-                yield (f"embed_tokens.{name}", p)
-            for i, layer in enumerate(self.model.layers):
-                for name, p in layer.named_parameters():
-                    yield (f"layers.{i}.{name}", p)
-            if self.model.norm is not None:
-                for name, p in self.model.norm.named_parameters():
-                    yield (f"norm.{name}", p)
-
-        def named_modules(self):
-            for name, mod in self.model.named_modules():
-                yield (name, mod)
-
-        def get_submodule(self, name):
-            parts = name.split(".")
-            obj = self.model
-            for part in parts:
-                if part == "embed_tokens":
-                    obj = obj.embed_tokens
-                elif part == "layers":
-                    continue
-                elif part == "norm":
-                    obj = obj.norm
-                elif part == "rotary_emb":
-                    obj = obj.rotary_emb
-                elif part.isdigit():
-                    obj = obj.layers[int(part)]
-                else:
-                    obj = getattr(obj, part)
-            return obj
-
+    # Build wrapper — PartialModel and PartialWrapper are now module-level
+    # nn.Module subclasses (see above). The hand-rolled to/eval/train/
+    # parameters/named_parameters/named_modules/get_submodule methods have
+    # been deleted; nn.Module provides all of them correctly.
     partial = PartialModel(embed_tokens, rotary_emb, prefix_layers, final_norm, full_model_config)
     wrapper = PartialWrapper(partial, full_model_config)
 
@@ -579,6 +586,77 @@ def load_qwen_super_block_only(sb_idx, model_name="Qwen/Qwen3.5-4B",
     n_params = sum(p.numel() for p in wrapper.model.parameters())
     print(f"  Loaded prefix: {n_params:,} params ({n_layers_loaded} layers + embed_tokens)", flush=True)
     return wrapper, tokenizer
+
+
+def capture_original_weights_from_checkpoint(sb_idx, model_name="Qwen/Qwen3.5-4B",
+                                              device="cuda"):
+    """Load original fp16/bf16 weights from the HuggingFace checkpoint for the
+    given super-block's layers, BEFORE palettization replaces the nn.Linear
+    modules with PalettizedLinear. Used for LoftQ SVD initialization of LoRA
+    (QwenLoRA init="loftq" branch at qwen_model.py:209-222).
+
+    The QLoRA paper (Dettmers et al. 2023, §3.2 "LoftQ: LoRA-Fine-Tuning-aware
+    Quantization") initializes LoRA A and B from the SVD of the quantization
+    error: LoRA_A, LoRA_B = SVD(W_orig - W_quantized). This gives LoRA a
+    non-zero warm start that directly compensates the leading quantization
+    error directions, saving the first ~1000 steps of zero-init climbing.
+
+    Returns:
+        dict: {tensor_name: weight_tensor} where tensor_name is the full
+        parameter name (e.g. "model.layers.0.linear_attn.in_proj_qkv.weight")
+        and weight_tensor is the original weight on `device` (CUDA by default
+        so the SVD in QwenLoRA.__init__ runs on-GPU without a host→device copy
+        per-tensor).
+
+    Memory:
+        Temporarily loads the full HF model (Qwen3.5-4B ~8 GB on disk,
+        ~16 GB in bf16 VRAM if device='cuda', ~8 GB RAM if device='cpu').
+        The full model is deleted + gc'd before returning, so only the
+        captured super-block weights (~1-2 GB for 4 layers) remain.
+
+    Args:
+        sb_idx: super-block index (0-7). Captures layers SUPER_BLOCKS[sb_idx].
+        model_name: HF model id (default "Qwen/Qwen3.5-4B").
+        device: where to place the captured weights ("cuda" by default so
+            the SVD in QwenLoRA.__init__ runs on-GPU directly; the call
+            site in train_qwen.py also passes device=DEVICE explicitly).
+    """
+    from transformers import AutoModelForCausalLM
+    import gc
+
+    sb_start, sb_end = SUPER_BLOCKS[sb_idx]
+    print(f"Capturing original weights for super-block {sb_idx} "
+          f"(layers {sb_start}-{sb_end-1}) from {model_name}...", flush=True)
+
+    # Load full model on CPU with low_mem to avoid OOM during build.
+    # dtype=bfloat16 matches the training dtype (DTYPE in train_qwen.py).
+    # The SVD in QwenLoRA will upcast to fp32 internally.
+    full_model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=torch.bfloat16, low_cpu_mem_usage=True,
+    )
+
+    weights = {}
+    for layer_idx in range(sb_start, sb_end):
+        layer = full_model.model.layers[layer_idx]
+        for name, param in layer.named_parameters():
+            if name.endswith(".weight"):
+                # Full HF parameter name: model.layers.{idx}.{submodule.path}.weight
+                # Matches the full_name format used in build_student_super_block
+                # (train_qwen.py:681: full_name = f"model.layers.{layer_idx}.{name}.weight")
+                full_name = f"model.layers.{layer_idx}.{name}"
+                weights[full_name] = param.data.clone().to(device)
+
+    # Free the full model — we only need the captured super-block weights.
+    del full_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    total_params = sum(t.numel() for t in weights.values())
+    print(f"  Captured {len(weights)} weight tensors ({total_params:,} params) "
+          f"on {device}", flush=True)
+    return weights
+
 
 def palettize_linear(linear_module, tensor_name, palettized_dir, device="cuda",
                      use_soft_indices=False):
