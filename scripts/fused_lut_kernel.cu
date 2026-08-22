@@ -1890,3 +1890,190 @@ void fused_lut_linear_soft_bwd_fused_aos_Launcher(
         grad_palette,
         M, K, N, group_size);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PATCH 7 — Batched compute_P_W (25 launches → 1)
+//
+//  Fuses all 25 per-PalettizedLinear compute_P_W launches into a SINGLE
+//  kernel launch by using blockIdx.z as the layer index. Each block
+//  computes one (16, 16) tile of one layer, identified by:
+//    layer_idx = blockIdx.z   (0 .. n_layers-1)
+//    j         = blockIdx.x * 16 + threadIdx.x
+//    o         = blockIdx.y * 16 + threadIdx.y
+//
+//  Layers with different (K, N) shapes share the same grid (sized to the
+//  max K and max N across all layers); blocks outside a layer's shape
+//  early-exit. The wasted threads cost ~30% of the launch but exit
+//  immediately and consume no SM resources.
+//
+//  The per-layer descriptors (logits/palette/P_aos/W_out pointers + K, N,
+//  G + seed_offset) live in __constant__ memory, which is broadcast-friendly:
+//  all warps in the same blockIdx.z slice read the same descriptor at the
+//  same address — free broadcast, no bank conflicts. Warps with different
+//  blockIdx.z read different descriptors (independent transactions), and
+//  since the SM scheduler assigns adjacent blocks to the same SM, there is
+//  no inter-SM contention.
+//
+//  See research-kernel-efficiency/03_batched_compute_pw.md.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Patch 7a — Per-layer descriptor struct
+//
+//  POD (plain old data) so we can memcpy a host-side array to __constant__
+//  memory via cudaMemcpyToSymbol. Defined at file scope (NOT in the
+//  anonymous namespace) so the launcher function (also at file scope) and
+//  the host-side wrapper in fused_lut_linear_cuda.py's CPP_SOURCE can
+//  both see it — though the wrapper only references the launcher by name
+//  and never instantiates the struct itself.
+//
+//  Layout (64 bytes on 64-bit platforms, 32 bytes on 32-bit — we assume 64-bit):
+//    logits       : const __half*        — pointer to (4, K, N) fp16 SoA INPUT
+//    palette      : const __nv_bfloat16* — pointer to (G, 4) bf16 INPUT
+//    P_aos        : __half*              — pointer to (K, N, 4) fp16 AoS OUTPUT
+//    W_out        : __nv_bfloat16*       — pointer to (K, N) bf16 OUTPUT
+//    K, N, G      : int                  — layer shape
+//    seed_offset  : uint32_t             — unique per-layer offset for Gumbel
+//                                          noise decorrelation (XORed into seed)
+// ─────────────────────────────────────────────────────────────────────────────
+struct PalettizedLayerDesc {
+    const __half*        logits;        // (4, K, N) fp16 — INPUT stays SoA
+    const __nv_bfloat16* palette;       // (G, 4)    bf16
+    __half*              P_aos;         // (K, N, 4) fp16 — OUTPUT is AoS
+    __nv_bfloat16*       W_out;         // (K, N)    bf16
+    int K, N, G;
+    uint32_t seed_offset;
+};
+
+// __constant__ array — over-provisioned to 64 entries (the current model
+// has 25 PalettizedLinear layers per super-block, so 64 leaves room for
+// future expansion). Total size: 64 × 64 B = 4 KB on 64-bit platforms,
+// well within Blackwell's 64 KB constant-memory limit.
+__constant__ PalettizedLayerDesc d_batched_compute_P_W_descs[64];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Patch 7b — Batched compute_P_W kernel (blockIdx.z = layer index)
+//
+//  Same per-element math as fused_lut_linear_soft_compute_P_W_aos_kernel,
+//  but reads its inputs/outputs from the descriptor in __constant__ memory
+//  indexed by blockIdx.z, rather than from kernel arguments.
+//
+//  Grid:  (cdiv(max_K, 16), cdiv(max_N, 16), n_layers)
+//  Block: (16, 16) = 256 threads
+//  Smem:  none
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void fused_compute_P_W_batched_kernel(
+    uint32_t step_seed,
+    int n_layers,
+    int group_size,
+    float tau
+) {
+    const int layer_idx = blockIdx.z;
+    if (layer_idx >= n_layers) return;
+
+    // Read the per-layer descriptor from __constant__ memory (broadcast).
+    const PalettizedLayerDesc desc = d_batched_compute_P_W_descs[layer_idx];
+
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int o = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= desc.K || o >= desc.N) return;
+
+    const int g = o / group_size;
+    const int idx      = j * desc.N + o;
+    const int idx_aos  = idx * 4;
+    const int plane_size = desc.K * desc.N;
+
+    // ── Load 4 logits from SoA layout (input unchanged)
+    float l0 = __half2float(desc.logits[0 * plane_size + idx]);
+    float l1 = __half2float(desc.logits[1 * plane_size + idx]);
+    float l2 = __half2float(desc.logits[2 * plane_size + idx]);
+    float l3 = __half2float(desc.logits[3 * plane_size + idx]);
+
+    // ── Gumbel noise (decorrelated per layer via desc.seed_offset XOR)
+    // We reuse the existing __device__ gumbel_sample() helper (defined above
+    // at file scope in the anonymous namespace). It hashes (seed, idx) into
+    // a unique LCG state per (j, o, k), so we just need to give each layer a
+    // distinct seed: layer_seed = step_seed XOR (seed_offset * golden-ratio-u32).
+    uint32_t layer_seed = step_seed ^ (desc.seed_offset * 0x9E3779B9u);
+    float inv_tau = 1.0f / tau;
+    float n0 = (l0 + gumbel_sample(layer_seed, idx * 4 + 0)) * inv_tau;
+    float n1 = (l1 + gumbel_sample(layer_seed, idx * 4 + 1)) * inv_tau;
+    float n2 = (l2 + gumbel_sample(layer_seed, idx * 4 + 2)) * inv_tau;
+    float n3 = (l3 + gumbel_sample(layer_seed, idx * 4 + 3)) * inv_tau;
+
+    // ── Softmax (numerically stable)
+    float m = fmaxf(fmaxf(n0, n1), fmaxf(n2, n3));
+    float e0 = expf(n0 - m);
+    float e1 = expf(n1 - m);
+    float e2 = expf(n2 - m);
+    float e3 = expf(n3 - m);
+    float s = e0 + e1 + e2 + e3;
+    float p0 = e0 / s, p1 = e1 / s, p2 = e2 / s, p3 = e3 / s;
+
+    // ── Write P_aos (K, N, 4) — 4 adjacent fp16 values (coalesced 64-bit STG)
+    desc.P_aos[idx_aos + 0] = __float2half(p0);
+    desc.P_aos[idx_aos + 1] = __float2half(p1);
+    desc.P_aos[idx_aos + 2] = __float2half(p2);
+    desc.P_aos[idx_aos + 3] = __float2half(p3);
+
+    // ── Compute W = Σ_k P[k] * palette[g, k]
+    float c0 = __bfloat162float(desc.palette[g * 4 + 0]);
+    float c1 = __bfloat162float(desc.palette[g * 4 + 1]);
+    float c2 = __bfloat162float(desc.palette[g * 4 + 2]);
+    float c3 = __bfloat162float(desc.palette[g * 4 + 3]);
+    float W_val = p0 * c0 + p1 * c1 + p2 * c2 + p3 * c3;
+    desc.W_out[idx] = __float2bfloat16(W_val);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Patch 7b — Launcher for the batched compute_P_W kernel.
+//
+//  Accepts host-side arrays of pointers + per-layer shapes (already
+//  validated by the C++ wrapper in fused_lut_linear_cuda.py), builds the
+//  host-side PalettizedLayerDesc array, copies it to __constant__ memory,
+//  and launches a single kernel with grid.z = n_layers.
+//
+//  The launcher (defined here in the .cu file) is the ONLY place that
+//  references the __constant__ symbol d_batched_compute_P_W_descs and the
+//  PalettizedLayerDesc struct — the C++ wrapper in CPP_SOURCE just calls
+//  this launcher by name and never touches the struct directly.
+// ─────────────────────────────────────────────────────────────────────────────
+void fused_compute_P_W_batched_Launcher(
+    const c10::Half* const*     logits_ptrs,    // host array [n_layers]
+    const c10::BFloat16* const* palette_ptrs,   // host array [n_layers]
+    c10::Half* const*           P_aos_ptrs,     // host array [n_layers]
+    c10::BFloat16* const*       W_out_ptrs,     // host array [n_layers]
+    const int*                  Ks,             // host array [n_layers]
+    const int*                  Ns,             // host array [n_layers]
+    const int*                  Gs,             // host array [n_layers]
+    int n_layers,
+    int group_size,
+    float tau,
+    uint32_t step_seed
+) {
+    // Build host-side descriptor array (stack-allocated — 64 × 64 B = 4 KB max)
+    PalettizedLayerDesc h_descs[64];
+    int max_K = 0, max_N = 0;
+    for (int i = 0; i < n_layers; ++i) {
+        h_descs[i].logits  = reinterpret_cast<const __half*>(logits_ptrs[i]);
+        h_descs[i].palette = reinterpret_cast<const __nv_bfloat16*>(palette_ptrs[i]);
+        h_descs[i].P_aos   = reinterpret_cast<__half*>(P_aos_ptrs[i]);
+        h_descs[i].W_out   = reinterpret_cast<__nv_bfloat16*>(W_out_ptrs[i]);
+        h_descs[i].K       = Ks[i];
+        h_descs[i].N       = Ns[i];
+        h_descs[i].G       = Gs[i];
+        h_descs[i].seed_offset = (uint32_t)i;
+        if (Ks[i] > max_K) max_K = Ks[i];
+        if (Ns[i] > max_N) max_N = Ns[i];
+    }
+
+    // Copy descriptors to __constant__ memory (single CPU→GPU memcpy per step)
+    cudaMemcpyToSymbol(d_batched_compute_P_W_descs, h_descs,
+                       sizeof(PalettizedLayerDesc) * n_layers);
+
+    // Single kernel launch — grid.z = n_layers
+    dim3 grid((max_K + 15) / 16, (max_N + 15) / 16, n_layers);
+    dim3 block(16, 16);
+    fused_compute_P_W_batched_kernel<<<grid, block, 0, 0>>>(
+        step_seed, n_layers, group_size, tau);
+}
