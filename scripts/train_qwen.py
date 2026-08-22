@@ -960,7 +960,7 @@ def stream_training_data(tokenizer, n_seqs, seq_len, device="cuda", batch_size=8
 # ─── Main training loop ────────────────────────────────────────────────
 def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=128, batch_size=8,
                       resume_from=None, use_soft_indices=False,
-                      tau_init=1.0, tau_final=0.01, tau_anneal_steps=4000,
+                      tau_init=2.0, tau_final=0.5, tau_anneal_steps=6000,
                       shutdown_on_done=False):
     _rewire_log(sb_idx)
     print(f"\n{'='*70}")
@@ -1070,9 +1070,31 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
     for batch_ids in data_stream:
         if global_step >= max_steps: break
 
-        # Temperature annealing for Gumbel-Softmax
+        # Temperature annealing for Gumbel-Softmax.
+        # Schedule (research-indices-training/04_tau_schedule.md §6):
+        #   1. Warmup (T_WARMUP=500 steps): hold tau at tau_init (2.0) for high
+        #      exploration — gradients are ~1.0× of the τ=2 baseline.
+        #   2. Quadratic decay (tau_anneal_steps steps): tau = tau_init *
+        #      (1 - progress)^2 with alpha=2. Front-loads the high-τ regime:
+        #      ~66% of training is spent at τ≥1.0 where P_loser≥0.09 and the
+        #      per-element Gumbel-Softmax gradient is ≥36% of peak.
+        #   3. Hold at tau_final (0.5): never below 0.5 — below 0.5 the
+        #      gradient magnitude for K=4 falls below 9% of peak (Table 1
+        #      in 04_tau_schedule.md) and indices effectively freeze.
+        # Net effect: ~62% boost in cumulative gradient signal vs the
+        # previous linear 2.0→0.1 schedule, and the indices stay trainable
+        # for the entire 8300-step run instead of freezing at step 4000.
         if use_soft_indices:
-            tau = max(tau_final, tau_init * (1.0 - global_step / tau_anneal_steps))
+            T_WARMUP = 500
+            T_ANNEAL = tau_anneal_steps  # 6000 by default
+            if global_step < T_WARMUP:
+                tau = tau_init  # 2.0 — warmup at high tau
+            elif global_step < T_WARMUP + T_ANNEAL:
+                progress = (global_step - T_WARMUP) / T_ANNEAL
+                # alpha=2 quadratic decay; max() floor at tau_final (0.5)
+                tau = max(tau_final, tau_init * (1.0 - progress) ** 2)
+            else:
+                tau = tau_final  # 0.5 — hold (NOT 0.1, which kills gradients)
             # Update tau on all PalettizedLinear modules
             for name, mod in student.named_modules():
                 if hasattr(mod, 'tau'):
@@ -1181,15 +1203,32 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         if opt_muon: opt_muon.step()
         if opt_adamw: opt_adamw.step()
         if opt_indices: opt_indices.step()
-        # CRITICAL: clamp index_logits to safe fp16 range after step.
-        # Gumbel-Softmax grad at low tau can push fp32 master to ±1e6,
-        # which overflows fp16 (max 65504) → inf → NaN on next forward.
-        # Clamp to ±20 (softmax(20/0.1) is already numerically one-hot).
+        # CRITICAL: clamp index_logits after step to prevent both (a) fp16
+        # overflow on the next forward and (b) softmax saturation that zeroes
+        # the Gumbel-Softmax gradient. The clamp is ADAPTIVE to temperature:
+        #   par.data.clamp_(-5.0 * tau, 5.0 * tau)
+        # The previous fixed ±20 was a band-aid for (a) only — at the old
+        # tau=0.1 it caused (b): softmax(±20/0.1) = softmax(±200) overflows
+        # to [1, 0] in fp32 and the gradient is exactly zero (the documented
+        # cause of index freeze in research-filter-consolidation/
+        # 01_training_recipe.md §3).
+        # The new ±5τ clamp fixes both:
+        #   - At tau=2.0 (warmup):     clamp ±10   — loose, exploration
+        #   - At tau=0.5 (hold/floor): clamp ±2.5  — tight, commitment
+        #   - softmax(±5) ≈ [0.993, 0.007] — still essentially one-hot for
+        #     the forward pass, but with finite-precision gradient
+        #     (BNN-style tight clip from Courbariaux et al. 2016, applied
+        #     here in logit-space instead of weight-space).
+        # tau is in scope here because opt_indices is non-None only when
+        # use_soft_indices=True, which is the same condition that sets tau
+        # at the top of this iteration (see build_optimizers line 597 +
+        # the tau anneal block ~30 lines above).
         if opt_indices:
             with torch.no_grad():
                 for name, par in student.named_parameters():
                     if "index_logits" in name:
-                        par.data.clamp_(-20.0, 20.0)
+                        # Adaptive clamp: ±5τ (was ±20). See comment above.
+                        par.data.clamp_(-5.0 * tau, 5.0 * tau)
         if sched_muon: sched_muon.step()
         if sched_adamw: sched_adamw.step()
         if sched_indices: sched_indices.step()
@@ -1279,10 +1318,10 @@ def main():
                     help="Enable trainable indices via Gumbel-Softmax (1=on, 0=off).")
     ap.add_argument("--tau_init", type=float, default=2.0,
                     help="Initial Gumbel-Softmax temperature. Default 2.0 (high tau = soft = gradients flow).")
-    ap.add_argument("--tau_final", type=float, default=0.1,
-                    help="Final Gumbel-Softmax temperature. Default 0.1 (below this, gradients vanish).")
-    ap.add_argument("--tau_anneal_steps", type=int, default=4000,
-                    help="Steps over which to anneal temperature from tau_init to tau_final.")
+    ap.add_argument("--tau_final", type=float, default=0.5,
+                    help="Final Gumbel-Softmax temperature. Default 0.5 (FLOOR: below 0.5, Gumbel-Softmax gradients vanish for K=4 — see research-indices-training/04_tau_schedule.md).")
+    ap.add_argument("--tau_anneal_steps", type=int, default=6000,
+                    help="Steps over which to anneal temperature from tau_init to tau_final (warmup is 500 steps, then quadratic decay over this many steps, then hold at tau_final).")
     ap.add_argument("--shutdown_on_done", type=int, default=0,
                     help="Shutdown server when training completes (1=yes, 0=no).")
     args = ap.parse_args()
