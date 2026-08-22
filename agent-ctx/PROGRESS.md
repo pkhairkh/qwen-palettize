@@ -8,7 +8,7 @@
 
 | Agent | Branch | Wave 1 | Wave 2 | Wave 3 | Merged |
 |-------|--------|--------|--------|--------|--------|
-| nn-module-foundation | `agent/nn-module-foundation` | ✅ Done | ✅ Done | 🔄 In Progress | ⬜ |
+| nn-module-foundation | `agent/nn-module-foundation` | ✅ Done | ✅ Done | ✅ Done | ⬜ (ready for orchestrator) |
 | training-recipe | `agent/training-recipe` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | kernels | `agent/kernels` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | optimizer-streams | `agent/optimizer-streams` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
@@ -19,10 +19,10 @@
 
 ## Merge Order
 
-1. ⬜ nn-module-foundation (foundation — must merge first)
-2. ⬜ training-recipe (rebases on nn-module)
-3. ⬜ kernels (independent — can merge anytime after Wave 1)
-4. ⬜ optimizer-streams (rebases on nn-module + training-recipe)
+1. ✅ nn-module-foundation (foundation — must merge first) — **ready for orchestrator merge**
+2. ⬜ training-recipe (rebases on nn-module) — pending nn-module merge
+3. ⬜ kernels (independent — can merge anytime after Wave 1) — pending nn-module merge
+4. ⬜ optimizer-streams (rebases on nn-module + training-recipe) — pending both merges
 
 ---
 
@@ -55,6 +55,7 @@
 | 2026-08-22T12:05:00Z | nn-module-foundation | Patch 2a: added capture_original_weights_from_checkpoint helper (commit `6c21347`) |
 | 2026-08-22T12:10:00Z | nn-module-foundation | Patch 2b: build_student_super_block passes original_weight to QwenLoRA for LoftQ SVD init (commit `e928898`) |
 | 2026-08-22T12:12:00Z | nn-module-foundation | Wave 2 complete: syntax checks pass, end-to-end LoftQ flow verified |
+| 2026-08-22T12:05:51Z | nn-module-foundation | Wave 3 complete: branch merges cleanly with main (fast-forward, no conflicts); sent final merge-ready messages to all 3 dependent agents |
 
 ---
 
@@ -63,6 +64,6 @@
 | Agent | Last Message | From | Subject | Action Required |
 |-------|--------------|------|---------|-----------------|
 | nn-module-foundation | — | — | — | — |
-| training-recipe | 2026-08-22T11:57:57Z | nn-module-foundation | RELEASED: nn.Module merged — Patch 9 complete | rebase after orchestrator merges agent/nn-module-foundation to main |
-| kernels | 2026-08-22T11:57:57Z | nn-module-foundation | Wave 1 complete (Patch 9 nn.Module) — no action needed | nothing |
-| optimizer-streams | 2026-08-22T11:57:57Z | nn-module-foundation | RELEASED: nn.Module merged — Patch 9 complete | rebase after orchestrator merges agent/nn-module-foundation to main |
+| training-recipe | 2026-08-22T12:05:51Z | nn-module-foundation | Merge ready — Patch 9 + Patch 2 complete | wait for orchestrator to merge agent/nn-module-foundation, then rebase |
+| kernels | 2026-08-22T12:05:51Z | nn-module-foundation | Merge ready — Patch 9 + Patch 2 complete (no action needed) | nothing — merge anytime after orchestrator merges agent/nn-module-foundation |
+| optimizer-streams | 2026-08-22T12:05:51Z | nn-module-foundation | Merge ready — Patch 9 + Patch 2 complete | wait for orchestrator to merge agent/nn-module-foundation + agent/training-recipe, then rebase |
