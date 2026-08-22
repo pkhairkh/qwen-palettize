@@ -62,6 +62,37 @@ def is_gated_delta_layer(layer_idx):
 #   - Bottom line: keep native autograd. Speedups come from seq_len/batch_size
 #     and from reducing Python overhead elsewhere.
 
+
+def _apply_rmsnorm_eager(x, weight, eps=1e-6):
+    """Eager (non-fused) RMSNorm — applied to the LAST dim of `x`.
+
+    Used by `PalettizedLinear.forward(out_norm=...)` as a functional fallback
+    when the Triton soft/hard kernel does not yet fuse the RMSNorm
+    (pre-Patch-10 state). The layer-fusion agent's Patch 10 will replace
+    this eager call with a fused Triton kernel that takes `out_norm` as an
+    extra argument and computes RMSNorm + palettized matmul in a single
+    pass — eliminating the intermediate `x_normed` HBM write/read
+    (~2 × M × K × 2 bytes per layer saved) and one kernel launch.
+
+    Formula (matches HF Qwen3_5RMSNorm):
+        x_normed = x / sqrt(mean(x^2, dim=-1) + eps) * weight
+
+    Args:
+        x: tensor of shape (..., in_features). Any dtype.
+        weight: RMSNorm weight tensor of shape (in_features,). Any dtype.
+        eps: RMSNorm epsilon. Default 1e-6 (HF Qwen3_5 default).
+
+    Returns:
+        Tensor of same shape and dtype as `x`.
+    """
+    # Compute in fp32 for numerical stability (matches HF RMSNorm behavior
+    # under autocast — variance is computed in fp32, then cast back).
+    x_f = x.float()
+    var = x_f.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x_f * torch.rsqrt(var + eps)
+    return x_normed.to(x.dtype) * weight.to(x.dtype)
+
+
 class PalettizedLinear(nn.Module):
     """2-bit palettized Linear replacement with trainable indices + dual-mode forward.
 
@@ -144,7 +175,39 @@ class PalettizedLinear(nn.Module):
         else:
             self.index_logits = None
 
-    def forward(self, x):
+    def forward(self, x, out_norm=None):
+        """Palettized forward: y = x_normed @ W_reconstructed + bias.
+
+        Args:
+            x: input tensor of shape (..., in_features). When `out_norm`
+                is None, `x` is used directly (no normalization).
+            out_norm: optional RMSNorm weight tensor of shape (in_features,).
+                When provided, RMSNorm is applied to `x` BEFORE the
+                palettized matmul. This is the Python-side hook that
+                enables the layer-fusion agent's Patch 10 (fused
+                RMSNorm + PalettizedLinear in a single Triton kernel).
+
+                Current behavior (pre-Patch-10): RMSNorm is applied
+                eagerly via `_apply_rmsnorm_eager` before the Triton /
+                CUDA / PyTorch kernel is called. This is functionally
+                correct but NOT fused — the normalized `x_normed` is
+                materialized to HBM and read back by the matmul kernel.
+
+                Post-Patch-10 behavior (planned by layer-fusion agent):
+                the Triton soft/hard kernel will accept `out_norm` as an
+                extra argument and fuse the RMSNorm into the matmul
+                prologue (load x tile → compute variance → normalize →
+                matmul), eliminating the `x_normed` HBM round-trip.
+
+                Shape: (in_features,). Dtype: any (will be cast to x's
+                dtype). The RMSNorm epsilon is fixed at 1e-6 to match
+                HF Qwen3_5RMSNorm.
+
+        Backward compatibility: `out_norm` defaults to None, so all
+        existing call sites (e.g. `layer.linear_attn.out_proj(h)`,
+        `QwenLoRA.forward` calling `self.base(x)`, `_palettized_lora_forward`
+        calling `self.lora_A_pal(x_flat)`) continue to work unchanged.
+        """
         orig_ndim = x.ndim
         if x.ndim == 3:
             B, S, _ = x.shape
@@ -152,9 +215,22 @@ class PalettizedLinear(nn.Module):
         else:
             x_flat = x
 
+        # Apply RMSNorm eagerly if out_norm is provided. The layer-fusion
+        # agent (Patch 10) will replace this with a fused Triton kernel
+        # call that accepts out_norm directly, eliminating the intermediate
+        # x_normed HBM write/read. Until then, this eager path is
+        # functionally correct (just not fused). See _apply_rmsnorm_eager
+        # docstring above for the formula and rationale.
+        if out_norm is not None:
+            x_flat = _apply_rmsnorm_eager(x_flat, out_norm, eps=1e-6)
+
         # ── Triton path (preferred — Wave 3 of triton-rewrite branch) ──────
         # Fuses Gumbel+softmax+STE+matmul (soft) and gather+matmul (hard)
         # into Triton kernels. No CUDA C, no torch.matmul, no Python elementwise.
+        # NOTE (Patch 11): the Triton kernels do NOT yet accept `out_norm` —
+        # the layer-fusion agent's Patch 10 will extend their signatures to
+        # fuse RMSNorm. When that lands, the eager `_apply_rmsnorm_eager`
+        # call above should be removed and `out_norm` passed through here.
         if self._use_triton and x_flat.is_cuda and not self.pre_transposed:
             if self.training and self.use_soft_indices and self.index_logits is not None:
                 y = self._triton_soft_kernel(
