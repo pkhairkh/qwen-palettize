@@ -359,11 +359,56 @@ class TritonSoftLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y):
-        # Wave 2 will implement this.
-        raise NotImplementedError(
-            "TritonSoftLinear.backward is implemented in Wave 2. "
-            "Run the Wave 1 forward-only test until then."
+        # Wave 2 — fused Triton backward. Three kernels:
+        #   1. grad_x = grad_y @ W_ste.T            (Triton TC matmul)
+        #   2. grad_W_soft = x.T @ grad_y           (Triton TC matmul, fp32 output)
+        #   3. elementwise: grad_logits + atomic grad_palette from P_aos + palette
+        # Math matches existing CUDA `fused_lut_linear_soft_bwd_fused_aos_kernel`.
+        from triton_soft_backward import (
+            fused_soft_bwd_grad_x_triton,
+            fused_soft_bwd_grad_W_triton,
+            fused_soft_bwd_elementwise_triton,
         )
+        x, palette, logits, P_aos, W_ste = ctx.saved_tensors
+        grad_y = grad_y.contiguous()
+        M, K = x.shape
+        _, _, N = logits.shape
+        G = palette.shape[0]
+        GS = ctx.group_size
+
+        needs_grad_x = ctx.needs_input_grad[0]
+        needs_grad_palette = ctx.needs_input_grad[1]
+        needs_grad_logits = ctx.needs_input_grad[2]
+        needs_grad_bias = ctx.has_bias and ctx.needs_input_grad[3]
+
+        # ── 1. grad_x = grad_y @ W_ste.T ────────────────────────────────────
+        grad_x = None
+        if needs_grad_x:
+            grad_x = fused_soft_bwd_grad_x_triton(grad_y, W_ste)
+
+        # ── 2 + 3. grad_logits + grad_palette (compute grad_W on-the-fly via matmul)
+        grad_logits = None
+        grad_palette = None
+        if needs_grad_logits or needs_grad_palette:
+            # grad_W_soft = x.T @ grad_y (fp32, for elementwise precision)
+            grad_W = fused_soft_bwd_grad_W_triton(x, grad_y)
+            # elementwise: grad_logits + atomic grad_palette
+            grad_logits, grad_palette = fused_soft_bwd_elementwise_triton(
+                grad_W, P_aos, palette, GS
+            )
+            if not needs_grad_logits:
+                grad_logits = None
+            if not needs_grad_palette:
+                grad_palette = None
+
+        # grad_bias = grad_y.sum(dim=0) — kept in PyTorch (one reduction per step,
+        # not the hot path; fusing into a Triton kernel is in Wave 4 / Kernel 4)
+        grad_bias = None
+        if needs_grad_bias:
+            grad_bias = grad_y.sum(dim=0)
+
+        # Return tuple matches forward input order: (x, palette, logits, bias, group_size, tau)
+        return grad_x, grad_palette, grad_logits, grad_bias, None, None
 
 
 def triton_soft_linear(
