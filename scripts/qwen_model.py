@@ -289,13 +289,67 @@ class QwenLoRA(nn.Module):
             return gathered.T  # (out_dim, in_dim)
 
     def forward(self, x):
-        y_base = self.base(x)
         orig_ndim = x.ndim
         if x.ndim == 3:
             B_, S_, _ = x.shape
             x_flat = x.reshape(-1, x.shape[-1])
         else:
             x_flat = x
+
+        # Patch 20 (lora-fusion): try fused PalettizedLinear + LoRA combined
+        # forward+backward first. This fuses the PalettizedLinear soft STE
+        # path with the LoRA forward into a SINGLE autograd node, with a
+        # combined grad_x matmul in the backward that eliminates the 31
+        # aten::add_ for grad_x accumulation (167ms per step).
+        #
+        # Activation criteria (all must hold):
+        #   - x is bf16 on CUDA
+        #   - lora_A, lora_B are bf16 nn.Parameters (NOT PalettizedLinear modules)
+        #   - self.base is a PalettizedLinear with the Triton soft path enabled
+        #   - self.base is in training mode with use_soft_indices=True and
+        #     index_logits is initialized
+        # If any criterion fails, fall through to the unfused path (Patch 19
+        # Triton LoRA kernel + separate y_base = self.base(x)).
+        base = self.base
+        if (x_flat.is_cuda
+                and x_flat.dtype == torch.bfloat16
+                and self.lora_A.dtype == torch.bfloat16
+                and self.lora_B.dtype == torch.bfloat16
+                and isinstance(base, PalettizedLinear)
+                and getattr(base, '_use_triton', False)
+                and base.training
+                and getattr(base, 'use_soft_indices', False)
+                and getattr(base, 'index_logits', None) is not None
+                and not getattr(self, '_palettized', False)):
+            try:
+                from triton_lora import fused_pl_lora_forward as _fused_pl_lora_fwd
+                y = _fused_pl_lora_fwd(
+                    x_flat,
+                    base.palette,
+                    base.index_logits,
+                    base.bias,
+                    base.group_size,
+                    base.tau,
+                    self.lora_A,
+                    self.lora_B,
+                    self.scaling,
+                )
+                if orig_ndim == 3:
+                    y = y.reshape(B_, S_, -1)
+                return y
+            except Exception:
+                # Fused PL+LoRA kernel failed (e.g. Triton import error,
+                # JIT compile error). Fall through to the unfused path
+                # (Patch 19 Triton LoRA + separate y_base).
+                pass
+
+        # Patch 19 (lora-fusion): unfused path - separate y_base + Triton LoRA.
+        # y_base calls PalettizedLinear.forward (which itself uses the Triton
+        # soft kernel when in training mode). The LoRA path uses our Triton
+        # fused kernel. The grad_x accumulation (grad_x_base + grad_x_lora)
+        # still uses an aten::add_ in the backward - this is the unfused
+        # overhead that Patch 20 (above) eliminates when conditions permit.
+        y_base = self.base(x)
         # Patch 19 (lora-fusion): try Triton fused LoRA kernel first.
         # The fused kernel computes y = (x @ A) @ B.T * scaling in a single
         # autograd node, with scaling fused into the output store (eliminates

@@ -720,3 +720,416 @@ def triton_lora_forward(
         y: (M, N) bf16 = (x @ lora_A) @ lora_B.T * scaling
     """
     return TritonLoRALinear.apply(x, lora_A, lora_B, scaling)
+
+
+# ============================================================================
+# WAVE 4 (Patch 20) - fused PalettizedLinear + LoRA backward
+# ============================================================================
+# Combine the grad_x from the PalettizedLinear path (grad_x_base = grad_y @
+# W_ste.T) with the grad_x from the LoRA path (grad_x_lora = grad_y @ (B @ A.T
+# * scaling).T) into a SINGLE matmul:
+#
+#   grad_x = grad_y @ (W_ste + lora_B @ lora_A.T * scaling).T
+#         = grad_y @ W_ste.T  +  grad_y @ (lora_B @ lora_A.T * scaling)
+#         = grad_x_base + grad_x_lora
+#
+# This eliminates the 31 aten::add_ (167ms total per step) that PyTorch's
+# autograd inserts to accumulate grad_x_base + grad_x_lora across the 31
+# LoRA modules per super-block. The combined matmul shares the grad_y load
+# across both paths, and the lora_B @ lora_A.T rank-32 update is computed
+# on-the-fly per output tile (never materialized as a separate (K, N)
+# tensor in HBM).
+#
+# Math derivation:
+#   W_combined[k, n] = W_ste[k, n] + sum_r lora_B[n, r] * lora_A[k, r] * scaling
+#   grad_x[m, k]     = sum_n grad_y[m, n] * W_combined[k, n]
+#                    = sum_n grad_y[m, n] * W_combined.T[n, k]
+#                    = (grad_y @ W_combined.T)[m, k]
+#
+# Tile structure (per program, output grad_x tile (BM, BK)):
+#   for n_iter in 0..cdiv(N, BN):
+#     - Load grad_y tile (BM, BN) at (m_chunk, n_iter*BN)        -- bf16
+#     - Load W_ste tile (BN, BK) at (n_iter*BN, k_chunk),         -- bf16
+#         loaded with swapped strides (n in rows, k in cols) so it
+#         is already in (BN, BK) layout for tl.dot.
+#     - Load lora_A tile (BR, BK) at (0..R, k_chunk)              -- bf16
+#         (loaded transposed: r in rows, k in cols)
+#     - Load lora_B tile (BN, BR) at (n_iter*BN, 0..R)            -- bf16
+#         (standard row-major)
+#     - lora_weight_tile (BN, BK) = lora_B_tile @ lora_A_tile    -- bf16
+#         = sum_r lora_B[n, r] * lora_A[k, r]
+#     - combined_weight_tile (BN, BK) = W_ste_tile + lora_weight_tile * scaling
+#     - acc += grad_y_tile @ combined_weight_tile                -- fp32
+#   store acc (BM, BK) bf16
+# ============================================================================
+@triton.autotune(
+    configs=[
+        # Large BN configs (no BN=64 - tensor core underutilization).
+        triton.Config({"BM": 128, "BN": 128, "BK": 64, "BR": 32, "GROUP_M": 8}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 128, "BN": 256, "BK": 64, "BR": 32, "GROUP_M": 8}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 256, "BN": 128, "BK": 64, "BR": 32, "GROUP_M": 8}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 256, "BN": 256, "BK": 64, "BR": 32, "GROUP_M": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BM": 128, "BN": 128, "BK": 32, "BR": 32, "GROUP_M": 8}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 128, "BN": 256, "BK": 32, "BR": 32, "GROUP_M": 8}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 256, "BN": 128, "BK": 32, "BR": 32, "GROUP_M": 8}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 128, "BN": 128, "BK": 64, "BR": 32, "GROUP_M": 4}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 64, "BN": 128, "BK": 64, "BR": 32, "GROUP_M": 8}, num_warps=4, num_stages=4),
+        triton.Config({"BM": 64, "BN": 256, "BK": 64, "BR": 32, "GROUP_M": 8}, num_warps=4, num_stages=4),
+    ],
+    key=["M", "K", "N", "R"],
+)
+@triton.jit
+def fused_pl_lora_bwd_grad_x_kernel(
+    grad_y_ptr,    # (M, N) bf16
+    W_ste_ptr,     # (K, N) bf16
+    lora_A_ptr,    # (K, R) bf16
+    lora_B_ptr,    # (N, R) bf16
+    grad_x_ptr,    # (M, K) bf16
+    M, K, N, R,
+    scaling,
+    stride_gym, stride_gyn,
+    stride_wk, stride_wn,
+    stride_ak, stride_ar,
+    stride_bn, stride_br,
+    stride_gxm, stride_gxk,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    BR: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """grad_x = grad_y @ (W_ste + lora_B @ lora_A.T * scaling).T  -> (M, K) bf16.
+
+    Combined matmul eliminating the 31 aten::add_ for grad_x accumulation
+    across 31 LoRA modules per super-block.
+
+    L2-cache-friendly GROUP_M swizzle (from Triton matmul tutorial) so
+    adjacent programs share grad_y rows in L2 cache.
+
+    R is small (32 in Qwen LoRA) -> BR=32 covers the full rank in one tl.dot.
+    """
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BM)
+    grid_k = tl.cdiv(K, BK)
+
+    # L2 cache swizzle
+    num_pid_in_group = GROUP_M * grid_k
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(grid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_k = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BM + tl.arange(0, BM)  # M direction (output row)
+    offs_k = pid_k * BK + tl.arange(0, BK)  # K direction (output col)
+    offs_n = tl.arange(0, BN)                # N direction (reduction)
+    offs_r = tl.arange(0, BR)                # R direction (LoRA rank reduction)
+
+    # grad_y tile (BM, BN) at (m_chunk, n_offset) -- standard row-major load
+    gy_ptrs = grad_y_ptr + offs_m[:, None] * stride_gym + offs_n[None, :] * stride_gyn
+    # W_ste tile (BN, BK) at (k_chunk, n_offset) -- load TRANSPOSED by swapping strides.
+    # W_ste[k, n] at k*stride_wk + n*stride_wn -> (BN, BK) with n in rows, k in cols.
+    w_ptrs = W_ste_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    # lora_A tile (BR, BK): r in rows, k in cols (transposed view of (K, R) row-major).
+    a_ptrs = lora_A_ptr + offs_r[:, None] * stride_ar + offs_k[None, :] * stride_ak
+    # lora_B tile (BN, BR): n in rows, r in cols (standard row-major).
+    b_ptrs = lora_B_ptr + offs_n[:, None] * stride_bn + offs_r[None, :] * stride_br
+
+    acc = tl.zeros((BM, BK), dtype=tl.float32)
+    for n_iter in range(0, tl.cdiv(N, BN)):
+        n_off = n_iter * BN
+        mask_gy = (offs_m[:, None] < M) & ((offs_n[None, :] + n_off) < N)
+        mask_w  = ((offs_n[:, None] + n_off) < N) & (offs_k[None, :] < K)
+        mask_a  = (offs_r[:, None] < R) & (offs_k[None, :] < K)
+        mask_b  = ((offs_n[:, None] + n_off) < N) & (offs_r[None, :] < R)
+
+        # Load grad_y tile (BM, BN) bf16.
+        gy_tile = tl.load(gy_ptrs, mask=mask_gy, other=0.0).to(tl.bfloat16)  # (BM, BN)
+        # Load W_ste tile (BN, BK) bf16 (transposed layout for matmul).
+        w_tile  = tl.load(w_ptrs, mask=mask_w, other=0.0).to(tl.bfloat16)   # (BN, BK)
+        # Load lora_A tile (BR, BK) bf16 (transposed).
+        a_tile  = tl.load(a_ptrs, mask=mask_a, other=0.0).to(tl.bfloat16)   # (BR, BK)
+        # Load lora_B tile (BN, BR) bf16.
+        b_tile  = tl.load(b_ptrs, mask=mask_b, other=0.0).to(tl.bfloat16)   # (BN, BR)
+
+        # Compute lora_weight_tile (BN, BK) = lora_B_tile @ lora_A_tile * scaling.
+        # = sum_r lora_B[n, r] * lora_A[k, r] * scaling
+        lora_weight_tile = tl.dot(b_tile, a_tile)  # (BN, BK) fp32 from tl.dot
+        lora_weight_tile = lora_weight_tile * scaling  # apply scaling
+
+        # Combined weight: W_combined[n, k] = W_ste[k, n] + lora_weight[n, k] * scaling.
+        # In fp32 for accumulation precision, then cast back to bf16 for the
+        # main matmul (matches existing triton_soft_backward fp32-acc pattern).
+        combined_weight = (w_tile.to(tl.float32) + lora_weight_tile).to(tl.bfloat16)  # (BN, BK)
+
+        # acc += grad_y_tile @ combined_weight -> (BM, BK) fp32.
+        acc += tl.dot(gy_tile, combined_weight)
+
+        gy_ptrs += BN * stride_gyn
+        w_ptrs  += BN * stride_wn
+        b_ptrs  += BN * stride_bn
+
+    gx_ptrs = grad_x_ptr + offs_m[:, None] * stride_gxm + offs_k[None, :] * stride_gxk
+    mask_gx = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+    tl.store(gx_ptrs, acc.to(tl.bfloat16), mask=mask_gx)
+
+
+def fused_pl_lora_bwd_grad_x_triton(
+    grad_y: torch.Tensor,    # (M, N) bf16
+    W_ste: torch.Tensor,     # (K, N) bf16
+    lora_A: torch.Tensor,    # (K, R) bf16
+    lora_B: torch.Tensor,    # (N, R) bf16
+    scaling: float,
+) -> torch.Tensor:
+    """grad_x = grad_y @ (W_ste + lora_B @ lora_A.T * scaling).T  -> (M, K) bf16.
+
+    Combined matmul eliminating the 31 aten::add_ for grad_x accumulation
+    across 31 LoRA modules per super-block.
+
+    The lora_B @ lora_A.T rank-R update is computed on-the-fly per output
+    tile inside the kernel (never materialized as a separate (K, N) tensor
+    in HBM). The scaling is fused into the lora_weight computation (no
+    separate aten::mul kernel).
+
+    Math:
+      W_combined[k, n] = W_ste[k, n] + sum_r lora_B[n, r] * lora_A[k, r] * scaling
+      grad_x[m, k]     = sum_n grad_y[m, n] * W_combined[k, n]
+                      = (grad_y @ W_combined.T)[m, k]
+    """
+    assert grad_y.dtype == torch.bfloat16, f"grad_y must be bf16, got {grad_y.dtype}"
+    assert W_ste.dtype == torch.bfloat16, f"W_ste must be bf16, got {W_ste.dtype}"
+    assert lora_A.dtype == torch.bfloat16, f"lora_A must be bf16, got {lora_A.dtype}"
+    assert lora_B.dtype == torch.bfloat16, f"lora_B must be bf16, got {lora_B.dtype}"
+    M, N = grad_y.shape
+    K, N2 = W_ste.shape
+    K3, R = lora_A.shape
+    N3, R2 = lora_B.shape
+    assert N == N2 == N3, f"N mismatch: grad_y.N={N}, W_ste.N={N2}, lora_B.N={N3}"
+    assert K == K3, f"K mismatch: W_ste.K={K}, lora_A.K={K3}"
+    assert R == R2, f"R mismatch: lora_A.R={R}, lora_B.R={R2}"
+
+    grad_y = grad_y.contiguous()
+    W_ste = W_ste.contiguous()
+    lora_A = lora_A.contiguous()
+    lora_B = lora_B.contiguous()
+    grad_x = torch.empty((M, K), dtype=torch.bfloat16, device=grad_y.device)
+
+    grid = lambda meta: (triton.cdiv(M, meta["BM"]) * triton.cdiv(K, meta["BK"]),)
+    fused_pl_lora_bwd_grad_x_kernel[grid](
+        grad_y, W_ste, lora_A, lora_B, grad_x,
+        M, K, N, R,
+        float(scaling),
+        grad_y.stride(0), grad_y.stride(1),
+        W_ste.stride(0), W_ste.stride(1),
+        lora_A.stride(0), lora_A.stride(1),
+        lora_B.stride(0), lora_B.stride(1),
+        grad_x.stride(0), grad_x.stride(1),
+    )
+    return grad_x
+
+
+# ============================================================================
+# Autograd Function - FusedPLLoRALinear (Patch 20)
+#   Combines PalettizedLinear soft forward + LoRA forward into a single
+#   autograd node, with combined grad_x backward.
+#
+#   forward: y_pl = fused_soft_matmul_triton(x, W_ste, bias)
+#                  where W_ste = compute_P_W_ste_triton(logits, palette, ...)
+#            y_lora, xA = fused_lora_forward_triton(x, A, B, scaling)
+#            y = y_pl + y_lora  (single aten::add inside Function.forward
+#                                - NOT tracked by autograd, NO backward aten::add)
+#            ctx.save_for_backward(x, palette, logits, P_aos, W_ste, A, B, xA)
+#
+#   backward: grad_x  = fused_pl_lora_bwd_grad_x_triton(grad_y, W_ste, A, B, scaling)
+#                              -- single combined matmul, NO aten::add
+#             grad_palette, grad_logits from triton_soft_backward (existing)
+#             grad_A, grad_B from triton_lora (Patch 19 kernels)
+#             grad_bias = grad_y.sum(dim=0)
+# ============================================================================
+class FusedPLLoRALinear(torch.autograd.Function):
+    """Fused PalettizedLinear (soft STE) + LoRA forward + backward.
+
+    Replaces the unfused pattern:
+        y_base = PalettizedLinear(x)         # autograd node 1 (TritonSoftLinear)
+        lora_out = (x @ A) @ B.T * scaling    # autograd node 2 (TritonLoRALinear)
+        y = y_base + lora_out                 # autograd node 3 (aten::add)
+    with a single autograd node, AND replaces the backward pattern:
+        grad_x_base = grad_y @ W_ste.T        # from node 1
+        grad_x_lora = grad_y @ (B @ A.T * scaling).T  # from node 2
+        grad_x = grad_x_base + grad_x_lora    # aten::add_ (167ms / step!)
+    with a single combined matmul:
+        grad_x = grad_y @ (W_ste + lora_B @ lora_A.T * scaling).T
+
+    Eliminates per step (31 LoRA modules):
+      - 31 aten::add_ for grad_x accumulation (167ms - the LoRA hot path)
+      - 31 separate grad_x_lora matmuls (replaced by combined weight matmul)
+      - 31 separate autograd nodes for the (y_base + lora_out) add
+
+    Calls existing triton_soft_forward / triton_soft_backward kernels directly
+    (no TritonSoftLinear.apply - we control the autograd node ourselves).
+    """
+
+    @staticmethod
+    def forward(ctx, x, palette, logits, bias,
+                group_size, tau, lora_A, lora_B, scaling):
+        # Import the existing triton_soft_forward kernels directly (no .apply)
+        from triton_soft_forward import (
+            compute_P_W_ste_triton, fused_soft_matmul_triton, _next_soft_step_seed,
+        )
+
+        x = x.contiguous()
+        palette = palette.contiguous()
+        logits = logits.contiguous()
+        lora_A = lora_A.contiguous()
+        lora_B = lora_B.contiguous()
+        if bias is not None:
+            bias = bias.contiguous()
+
+        M, K = x.shape
+        G, P_size = palette.shape
+        n_planes, K_, N = logits.shape
+        K2, R = lora_A.shape
+        N2, R2 = lora_B.shape
+        assert P_size == 4
+        assert n_planes == 4
+        assert K == K_, f"K mismatch: x.K={K} vs logits.K={K_}"
+        assert K == K2, f"K mismatch: x.K={K} vs A.K={K2}"
+        assert N == N2, f"N mismatch: logits.N={N} vs B.N={N2}"
+        assert R == R2, f"R mismatch: A.R={R} vs B.R={R2}"
+        assert N % group_size == 0
+        assert N // group_size == G
+
+        # --- PalettizedLinear soft forward (direct kernel calls) ---
+        # Compute P_aos + W_ste (matches TritonSoftLinear.forward path).
+        step_seed = _next_soft_step_seed()
+        P_aos, W_soft, W_ste = compute_P_W_ste_triton(
+            logits, palette, group_size, float(tau), step_seed
+        )
+        # y_pl = x @ W_ste + bias
+        y_pl = fused_soft_matmul_triton(x, W_ste, bias)
+
+        # --- LoRA forward (reuses Patch 19 fused kernel) ---
+        y_lora, xA = fused_lora_forward_triton(x, lora_A, lora_B, float(scaling))
+
+        # --- Combined output: y = y_pl + y_lora (single aten::add, INSIDE
+        #     the autograd.Function.forward - NOT tracked by autograd graph) ---
+        y = y_pl + y_lora
+
+        ctx.save_for_backward(x, palette, logits, P_aos, W_ste,
+                              lora_A, lora_B, xA)
+        ctx.group_size = group_size
+        ctx.tau = tau
+        ctx.scaling = float(scaling)
+        ctx.has_bias = bias is not None
+        ctx.M = M
+        ctx.K = K
+        ctx.N = N
+        ctx.R = R
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        from triton_soft_backward import (
+            fused_soft_bwd_grad_W_triton,
+            fused_soft_bwd_elementwise_triton,
+        )
+
+        x, palette, logits, P_aos, W_ste, lora_A, lora_B, xA = ctx.saved_tensors
+        grad_y = grad_y.contiguous()
+
+        needs_grad_x       = ctx.needs_input_grad[0]
+        needs_grad_palette = ctx.needs_input_grad[1]
+        needs_grad_logits  = ctx.needs_input_grad[2]
+        needs_grad_bias    = ctx.has_bias and ctx.needs_input_grad[3]
+        # group_size, tau - no grad (constants)
+        needs_grad_A       = ctx.needs_input_grad[6]
+        needs_grad_B       = ctx.needs_input_grad[7]
+
+        scaling = ctx.scaling
+        GS = ctx.group_size
+        M, K, N, R = ctx.M, ctx.K, ctx.N, ctx.R
+
+        # --- 1. Combined grad_x = grad_y @ (W_ste + lora_B @ lora_A.T * scaling).T
+        # This is the KEY Patch 20 contribution: a single matmul that combines
+        # grad_x_base (from W_ste) and grad_x_lora (from LoRA) without an
+        # aten::add_ accumulation. Eliminates 31 aten::add per step (167ms).
+        grad_x = None
+        if needs_grad_x:
+            grad_x = fused_pl_lora_bwd_grad_x_triton(
+                grad_y, W_ste, lora_A, lora_B, scaling
+            )
+
+        # --- 2. PalettizedLinear grads: grad_palette + grad_logits
+        # Uses existing triton_soft_backward kernels (delegated to triton-kernels
+        # agent - we IMPORT only, do not modify).
+        grad_palette = None
+        grad_logits = None
+        if needs_grad_palette or needs_grad_logits:
+            grad_W = fused_soft_bwd_grad_W_triton(x, grad_y)  # (K, N) fp32
+            grad_logits, grad_palette = fused_soft_bwd_elementwise_triton(
+                grad_W, P_aos, palette, GS
+            )
+            if not needs_grad_logits:
+                grad_logits = None
+            if not needs_grad_palette:
+                grad_palette = None
+
+        # --- 3. grad_bias = grad_y.sum(dim=0)
+        grad_bias = None
+        if needs_grad_bias:
+            grad_bias = grad_y.sum(dim=0)
+
+        # --- 4. LoRA grads: grad_A + grad_B (from Patch 19 fused kernels) ---
+        # Reuse the cached xA from forward to skip one M*K*R matmul recompute
+        # per LoRA module (saves 31 * 1.3 GFLOPS = 40 GFLOPS per step).
+        grad_A = None
+        grad_B = None
+        if needs_grad_A or needs_grad_B:
+            # grad_xA is needed for grad_A and grad_x_lora (Patch 19) but NOT
+            # for the combined grad_x (Patch 20 - that uses W_ste directly).
+            # We compute it here only for grad_A (grad_B uses xA cached).
+            if needs_grad_A:
+                grad_xA = fused_lora_grad_xA_triton(grad_y, lora_B, scaling)
+                grad_A = fused_lora_grad_A_triton(x, grad_xA)
+            if needs_grad_B:
+                # grad_B uses grad_y (with scaling fused into load) and cached xA.
+                grad_B = fused_lora_grad_B_triton(grad_y, xA, scaling)
+
+        # Return tuple matches forward input order:
+        # (x, palette, logits, bias, group_size, tau, lora_A, lora_B, scaling)
+        return (grad_x, grad_palette, grad_logits, grad_bias,
+                None, None, grad_A, grad_B, None)
+
+
+def fused_pl_lora_forward(
+    x: torch.Tensor,
+    palette: torch.Tensor,
+    logits: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+    tau: float,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    """Functional interface for fused PalettizedLinear + LoRA forward.
+
+    Computes y = PalettizedLinear.soft(x) + LoRA(x) in a single autograd node.
+    The backward uses a combined grad_x matmul that eliminates the aten::add_
+    for grad_x accumulation (Patch 20).
+
+    Args:
+        x:          (M, K) bf16 input
+        palette:    (G, 4) bf16 - PalettizedLinear palette (trainable)
+        logits:     (4, K, N) fp16 SoA - PalettizedLinear index logits
+        bias:       (N,) bf16 or None - PalettizedLinear bias
+        group_size: int - palette group size (typically 256)
+        tau:        float - Gumbel-Softmax temperature
+        lora_A:     (K, R) bf16 - LoRA A matrix (trainable)
+        lora_B:     (N, R) bf16 - LoRA B matrix (trainable)
+        scaling:    float - LoRA scaling factor (alpha / rank)
+    Returns:
+        y: (M, N) bf16 = x @ W_ste + bias + (x @ A) @ B.T * scaling
+    """
+    return FusedPLLoRALinear.apply(
+        x, palette, logits, bias,
+        group_size, tau, lora_A, lora_B, scaling,
+    )
