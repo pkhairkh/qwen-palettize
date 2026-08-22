@@ -1069,6 +1069,39 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
     event_s = [torch.cuda.Event(), torch.cuda.Event()]               # student-done events
     buf_idx = 0                                                      # ping-pong index
 
+    # ─── Epilogue / StopIteration handling (Round 1 fix) ────────────────────
+    # The for-loop's iteration protocol catches StopIteration automatically
+    # when data_stream is exhausted (n_seqs reached at line 918's generator).
+    # The `if global_step >= max_steps: break` below handles the case where
+    # max_steps < stream length. No explicit `next(data_stream)` call exists
+    # in this loop body — Python's `for ... in enumerate(...)` IS the
+    # fetch+catch wrapper. If a future refactor introduces an explicit
+    # `next(data_stream)` (e.g. for true N+1 prefetch), it MUST be wrapped:
+    #     if step + 1 < max_steps:
+    #         try:
+    #             next_batch = next(data_stream)
+    #         except StopIteration:
+    #             break
+    # to prevent StopIteration from leaking past the for-loop boundary (Python
+    # 3.7+ silently propagates StopIteration out of generator-exit contexts).
+    #
+    # Event-recording order verification (research 06 §3.1 invariants):
+    #   * event_s[buf_idx] is recorded IMMEDIATELY after compute_loss (line
+    #     ~1169), BEFORE loss.backward(). This is INTENTIONAL — the student
+    #     only READS h_out_buf[buf_idx] during compute_loss; backward() does
+    #     not touch h_out_buf (it computes grads of student.model.parameters
+    #     w.r.t. student_out, which depends on batch_ids, NOT h_out_buf).
+    #     Recording early lets the NEXT iter's teacher forward start as soon
+    #     as compute_loss completes, overlapping teacher_fwd(N+1) with
+    #     student_bwd(N) — the entire point of double-buffering. Recording
+    #     event_s AFTER backward would serialize teacher_fwd behind
+    #     student_bwd and forfeit the overlap.
+    #   * Teacher (next iter) waits on event_s[buf_idx] via
+    #     stream_t.wait_event(...) at line ~1107 BEFORE writing
+    #     h_out_buf[buf_idx]. Correct producer/consumer ordering.
+    #   * Student (current iter) waits on event_t[buf_idx] via
+    #     torch.cuda.current_stream().wait_event(...) at line ~1138 BEFORE
+    #     reading h_out_buf[buf_idx]. Correct producer/consumer ordering.
     for step, batch_ids in enumerate(data_stream):
         if global_step >= max_steps: break
 
