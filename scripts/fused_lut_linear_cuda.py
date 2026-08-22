@@ -383,8 +383,8 @@ std::vector<torch::Tensor> fused_lut_linear_soft_bwd_fused(
 //   P_aos: (K, N, 4) fp16 — saved for backward (contiguous, AoS)
 //   W:     (K, N)    bf16 — materialized weights, saved for backward
 //
-// The actual matmul y = x @ W is done here via torch::matmul (cuBLAS) so the
-// caller gets the same single-tensor return the SoA variant produced.
+// Wave 1 optimization: NO matmul here — caller does STE matmul in Python.
+// Returns only {P_aos, W_soft} so the caller can compute W_ste and do ONE matmul.
 std::vector<torch::Tensor> fused_lut_linear_soft_fwd_aos(
     torch::Tensor x,         // (M, K) bf16 — used only to infer shapes/options
     torch::Tensor palette,   // (G, 4) bf16
@@ -417,10 +417,8 @@ std::vector<torch::Tensor> fused_lut_linear_soft_fwd_aos(
         W.data_ptr<c10::BFloat16>(),
         K, N, (int)group_size, (float)tau, (uint32_t)step_seed);
 
-    // y = x @ W + bias (cuBLAS, done in Python)
-    auto y = torch::matmul(x, W);
-
-    return {y, P_aos, W};
+    // NO matmul — caller does STE: y = x @ W_ste (one matmul, not two)
+    return {P_aos, W};
 }
 
 // ── Patch 5c.2: Fused soft backward (AoS P input) ───────────────────────────
@@ -825,11 +823,9 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         mod = _get_module()
         step_seed = _next_soft_step_seed()
 
-        # ── Patch 5c: call the AoS soft forward — returns (y, P_aos, W_soft)
-        # where P_aos is (K, N, 4) fp16 (contiguous AoS, used by the fused bwd
-        # kernel via a single coalesced 64-bit load per (j, o)).
-        # W_soft = Σ_k P[k] * palette[g, k]  (soft blend, for gradient)
-        y_soft, P_aos, W_soft = mod.fused_lut_linear_soft_fwd_aos(
+        # Wave 1 optimization: C++ wrapper returns {P_aos, W_soft} — NO y_soft matmul.
+        # The caller does ONE matmul: y = x @ W_ste (not two like before).
+        P_aos, W_soft = mod.fused_lut_linear_soft_fwd_aos(
             x, palette, logits, group_size, float(tau), step_seed
         )
 
@@ -839,10 +835,6 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
         # W = W_hard - W_soft.detach() + W_soft
         #   forward value = W_hard (exact one-hot → cos preserved)
         #   backward grad  = through W_soft (indices actually train)
-        #
-        # NOTE: STE uses logits.argmax(dim=0) — logits are still (4, K, N) SoA,
-        # so this code path is UNCHANGED by Patch 5. Only P's storage moved to
-        # (K, N, 4) AoS, and P is not referenced here (the STE uses logits + W_soft).
         with torch.no_grad():
             argmax_idx = logits.argmax(dim=0)  # (K, N) — hard index assignment
             # Gather: W_hard[k, n] = palette[n // group_size, argmax_idx[k, n]]
@@ -851,9 +843,8 @@ class CUDAFusedLUTLinearSoft(torch.autograd.Function):
             W_hard = palette[group_per_col.long(), argmax_idx.long()].to(W_soft.dtype)  # (K, N) bf16
         # STE trick: forward = W_hard, backward = through W_soft
         W = W_hard - W_soft.detach() + W_soft
-        # Recompute y with the STE weight (original y_soft used W_soft)
+        # ONE matmul (was TWO: y_soft + y)
         y = torch.matmul(x, W)
-        del y_soft  # free the soft forward output
 
         # Add bias if provided
         if bias is not None:
