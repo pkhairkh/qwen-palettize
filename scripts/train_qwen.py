@@ -1240,10 +1240,10 @@ def main():
                     help="Enable trainable indices via Gumbel-Softmax (1=on, 0=off).")
     ap.add_argument("--tau_init", type=float, default=2.0,
                     help="Initial Gumbel-Softmax temperature. Default 2.0 (high tau = soft = gradients flow).")
-    ap.add_argument("--tau_final", type=float, default=0.1,
-                    help="Final Gumbel-Softmax temperature. Default 0.1 (below this, gradients vanish).")
-    ap.add_argument("--tau_anneal_steps", type=int, default=4000,
-                    help="Steps over which to anneal temperature from tau_init to tau_final.")
+    ap.add_argument("--tau_final", type=float, default=0.5,
+                    help="Final Gumbel-Softmax temperature. Default 0.5 (FLOOR: below 0.5, Gumbel-Softmax gradients vanish for K=4 — see research-indices-training/04_tau_schedule.md).")
+    ap.add_argument("--tau_anneal_steps", type=int, default=6000,
+                    help="Steps over which to anneal temperature from tau_init to tau_final (warmup is 500 steps, then quadratic decay over this many steps, then hold at tau_final).")
     ap.add_argument("--shutdown_on_done", type=int, default=0,
                     help="Shutdown server when training completes (1=yes, 0=no).")
     args = ap.parse_args()
