@@ -1203,6 +1203,48 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
                 if hasattr(mod, 'tau'):
                     mod.tau = tau
 
+        # ─── Patch 25 (quality-recipe): LUT-Q re-quantization at step 2000+4000 ──
+        # Re-runs k-means on the current W_recon per group to escape the
+        # k-means local optimum that gradient descent on the palette alone
+        # cannot escape (the indices are stuck at the k-means assignment, or
+        # in the soft path, the Gumbel-Softmax is converging to the same
+        # assignment as τ → 0). After re-quantization, index_logits are
+        # re-initialized as ±3 one-hot (NOT ±10 — better gradient flow per
+        # research-indices-training/01_gumbel_softmax_audit.md Finding 12).
+        # See research-palettes-training/06_staged_training.md Schedule C +
+        # docs/papers/1811.05355_LUTQ_Cardinaux2018.pdf (LUT-Q pattern) +
+        # docs/papers/2203.11086_QAT_Oscillations_Nagel2022.pdf (oscillation
+        # prevention via periodic re-quantization at carefully chosen step
+        # boundaries rather than every N steps).
+        # Conditioned on `use_soft_indices` per the research spec — in the
+        # hard path, indices are already frozen and re-quantization provides
+        # limited benefit (just re-runs k-means on slightly different palette
+        # values); in the soft path, re-quantization + ±3 logit re-init gives
+        # the indices a "fresh start" with better gradient flow, which is the
+        # actual mechanism that escapes the local optimum.
+        # NOTE: re-quantization fires at absolute global_step 2000+4000
+        # (NOT relative to resume_step) so resumed runs hit the same
+        # re-quantization points in the training trajectory. If the user
+        # resumes from a checkpoint at exactly step 2000 or 4000, the
+        # re-quantization will fire on the first iteration — this is a known
+        # edge case that may cause a double-fire if the previous run also
+        # re-quantized at that step. The cost is a few seconds of k-means
+        # compute; the benefit is correctness (no missed re-quantization).
+        if global_step in (2000, 4000) and use_soft_indices:
+            from re_quantize import re_quantize_indices
+            print(f"  [step {global_step}] LUT-Q re-quantization...", flush=True)
+            n_changed, n_total = re_quantize_indices(student, sb_idx, verbose=True)
+            # If <1% of indices changed, re-quantization has converged — log
+            # this for the operator (future runs can skip the step 4000 call
+            # if step 2000 already converged). No automatic skip here — the
+            # operator decides based on the log.
+            if n_total > 0 and n_changed / n_total < 0.01:
+                print(
+                    f"  [step {global_step}] re-quantization converged — "
+                    f"{n_changed}/{n_total} indices changed (<1%)",
+                    flush=True,
+                )
+
         # Check for JSON updates every 10 steps
         if global_step - last_hp_check >= 10:
             new_hp = load_hyperparams()
