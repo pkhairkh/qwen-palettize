@@ -475,6 +475,136 @@ std::vector<torch::Tensor> fused_lut_linear_soft_bwd_fused_aos(
 
     return {grad_logits, grad_palette};
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PATCH 7c — Batched compute_P_W host-side wrapper
+//
+//  Replaces 25 separate `fused_lut_linear_soft_fwd_aos` calls (one per
+//  PalettizedLinear) with a SINGLE batched kernel launch that processes
+//  all layers via blockIdx.z = layer_idx. See Patch 7a + 7b in
+//  fused_lut_kernel.cu for the kernel + launcher.
+//
+//  The host-side launcher (fused_compute_P_W_batched_Launcher, defined in
+//  the .cu file) takes raw host-side pointer arrays + per-layer shapes.
+//  This wrapper accepts std::vector<torch::Tensor> (so Python lists work
+//  naturally), allocates the per-layer P_aos + W outputs (managed by
+//  PyTorch), and builds the host-side pointer arrays to pass to the
+//  launcher.
+//
+//  Returns: flattened list of (P_aos_0, W_0, P_aos_1, W_1, ...) so the
+//  caller can zip them into pairs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Patch 7c — launcher prototype (defined in fused_lut_kernel.cu).
+// Note: the PalettizedLayerDesc struct is NOT visible here — the launcher
+// takes raw pointer arrays so the wrapper doesn't need to construct the
+// struct itself.
+void fused_compute_P_W_batched_Launcher(
+    const c10::Half* const*     logits_ptrs,    // host array [n_layers]
+    const c10::BFloat16* const* palette_ptrs,   // host array [n_layers]
+    c10::Half* const*           P_aos_ptrs,     // host array [n_layers]
+    c10::BFloat16* const*       W_out_ptrs,     // host array [n_layers]
+    const int*                  Ks,             // host array [n_layers]
+    const int*                  Ns,             // host array [n_layers]
+    const int*                  Gs,             // host array [n_layers]
+    int n_layers,
+    int group_size,
+    float tau,
+    uint32_t step_seed);
+
+std::vector<torch::Tensor> fused_compute_P_W_batched(
+    std::vector<torch::Tensor> logits_list,    // each (4, K_l, N_l) fp16
+    std::vector<torch::Tensor> palette_list,  // each (G_l, 4)    bf16
+    int64_t group_size,
+    double tau,
+    int64_t step_seed
+) {
+    int n_layers = (int)logits_list.size();
+    TORCH_CHECK(n_layers > 0, "logits_list must be non-empty");
+    TORCH_CHECK((int)palette_list.size() == n_layers,
+                "palette_list size must match logits_list size");
+    TORCH_CHECK(n_layers <= 64, "max 64 layers in batched kernel (got ", n_layers, ")");
+
+    // Validate inputs and allocate outputs in one pass.
+    // We hold pointers in std::vector (heap-allocated — n_layers is dynamic).
+    std::vector<const c10::Half*>     logits_ptrs(n_layers);
+    std::vector<const c10::BFloat16*> palette_ptrs(n_layers);
+    std::vector<c10::Half*>           P_aos_ptrs(n_layers);
+    std::vector<c10::BFloat16*>       W_out_ptrs(n_layers);
+    std::vector<int>                  Ks(n_layers);
+    std::vector<int>                  Ns(n_layers);
+    std::vector<int>                  Gs(n_layers);
+
+    std::vector<torch::Tensor> P_aos_list;
+    std::vector<torch::Tensor> W_list;
+    P_aos_list.reserve(n_layers);
+    W_list.reserve(n_layers);
+
+    for (int i = 0; i < n_layers; ++i) {
+        auto& logits  = logits_list[i];
+        auto& palette = palette_list[i];
+
+        TORCH_CHECK(logits.is_cuda() && logits.dtype() == torch::kHalf,
+                    "logits[", i, "] must be fp16 cuda");
+        TORCH_CHECK(palette.is_cuda() && palette.dtype() == torch::kBFloat16,
+                    "palette[", i, "] must be bf16 cuda");
+        TORCH_CHECK(logits.is_contiguous(),  "logits[", i, "] must be contiguous");
+        TORCH_CHECK(palette.is_contiguous(), "palette[", i, "] must be contiguous");
+        TORCH_CHECK(logits.dim() == 3 && logits.size(0) == 4,
+                    "logits[", i, "] must be (4, K, N)");
+        TORCH_CHECK(palette.dim() == 2 && palette.size(1) == 4,
+                    "palette[", i, "] must be (G, 4)");
+
+        int K = (int)logits.size(1);
+        int N = (int)logits.size(2);
+        int G = (int)palette.size(0);
+
+        TORCH_CHECK(N % group_size == 0,
+                    "layer ", i, ": N=", N, " not divisible by group_size=", group_size);
+        TORCH_CHECK(N / group_size == G,
+                    "layer ", i, ": G mismatch (N/GS=", N / group_size, " vs palette.size(0)=", G, ")");
+
+        // Allocate outputs: P_aos (K, N, 4) fp16 + W (K, N) bf16
+        auto P_aos = torch::empty({K, N, 4}, logits.options());
+        auto W     = torch::empty({K, N}, palette.options());
+
+        logits_ptrs[i]  = logits.data_ptr<c10::Half>();
+        palette_ptrs[i] = palette.data_ptr<c10::BFloat16>();
+        P_aos_ptrs[i]   = P_aos.data_ptr<c10::Half>();
+        W_out_ptrs[i]   = W.data_ptr<c10::BFloat16>();
+        Ks[i] = K;
+        Ns[i] = N;
+        Gs[i] = G;
+
+        P_aos_list.push_back(std::move(P_aos));
+        W_list.push_back(std::move(W));
+    }
+
+    // Single batched launch (host-side wrapper handles cudaMemcpyToSymbol
+    // + grid.z = n_layers, see fused_lut_kernel.cu).
+    fused_compute_P_W_batched_Launcher(
+        logits_ptrs.data(),
+        palette_ptrs.data(),
+        P_aos_ptrs.data(),
+        W_out_ptrs.data(),
+        Ks.data(),
+        Ns.data(),
+        Gs.data(),
+        n_layers,
+        (int)group_size,
+        (float)tau,
+        (uint32_t)step_seed);
+
+    // Return flattened (P_aos_0, W_0, P_aos_1, W_1, ...) — caller can zip
+    // consecutive pairs.
+    std::vector<torch::Tensor> result;
+    result.reserve(2 * n_layers);
+    for (int i = 0; i < n_layers; ++i) {
+        result.push_back(std::move(P_aos_list[i]));
+        result.push_back(std::move(W_list[i]));
+    }
+    return result;
+}
 """
 
 
@@ -524,6 +654,8 @@ def _build_module():
             # Patch 5: AoS variants — PalettizedLinear.forward/backward use these.
             "fused_lut_linear_soft_fwd_aos",
             "fused_lut_linear_soft_bwd_fused_aos",
+            # Patch 7: batched compute_P_W — replaces 25 per-layer launches with 1.
+            "fused_compute_P_W_batched",
         ],
         extra_cuda_cflags=extra_cuda_cflags,
         extra_cflags=extra_cflags,
@@ -821,3 +953,86 @@ def fused_lut_linear_soft(
         y: (M, N) bf16
     """
     return CUDAFusedLUTLinearSoft.apply(x, palette, logits, bias, group_size, tau)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PATCH 7c — Python wrapper for batched compute_P_W
+#
+#  Computes P_aos and W_soft for ALL PalettizedLinear submodules of `student`
+#  in a SINGLE kernel launch (blockIdx.z = layer_idx, see Patch 7a + 7b in
+#  fused_lut_kernel.cu). Replaces the 25 separate compute_P_W launches that
+#  happen when PalettizedLinear.forward is called per-layer.
+#
+#  PalettizedLinear.forward can OPTIONALLY use this batched path:
+#    1. Pre-compute (P_aos, W) for all 25 layers via this function.
+#    2. For each PalettizedLinear, look up its pre-computed W, apply STE
+#       (W_hard - W_soft.detach() + W_soft), and call torch.matmul(x, W).
+#    3. For backward, the autograd context saves the pre-computed P_aos.
+#
+#  Note: integrating this into PalettizedLinear.forward requires touching
+#  qwen_model.py — that file is owned by agent-nn-module-foundation, so
+#  the actual integration happens in their branch. This wrapper is the
+#  API surface they will call.
+# ─────────────────────────────────────────────────────────────────────────────
+def fused_compute_P_W_batched(
+    student,
+    tau: float,
+    step_seed: int,
+    group_size: int | None = None,
+):
+    """Compute P_aos + W_soft for all PalettizedLinears in one kernel launch.
+
+    Args:
+        student: an nn.Module containing PalettizedLinear submodules. We walk
+                 `student.named_modules()` and collect every PalettizedLinear
+                 that has `index_logits is not None` and `_use_cuda == True`.
+        tau: float — Gumbel-Softmax temperature (shared across all layers).
+        step_seed: int — per-step Gumbel seed (must be incremented per forward
+                   for noise diversity across steps; the batched kernel
+                   decorrelates per-layer noise via XOR with the layer index).
+        group_size: optional int — if None, uses each layer's own group_size
+                    (all layers MUST share the same GS for the batched
+                    kernel to work — we assert this).
+
+    Returns:
+        A list of `(P_aos, W)` tuples, one per PalettizedLinear (in the order
+        returned by `student.named_modules()`). Each `P_aos` is `(K, N, 4)`
+        fp16 AoS, each `W` is `(K, N)` bf16. Empty list if no PalettizedLinear
+        with index_logits is found.
+    """
+    # Deferred import: qwen_model.py is owned by agent-nn-module-foundation.
+    # If they rename PalettizedLinear, this will break — but that's their
+    # responsibility to coordinate via inbox.
+    from qwen_model import PalettizedLinear
+
+    layers = [
+        mod for _, mod in student.named_modules()
+        if isinstance(mod, PalettizedLinear)
+        and mod.index_logits is not None
+        and getattr(mod, "_use_cuda", False)
+    ]
+
+    if not layers:
+        return []
+
+    logits_list  = [mod.index_logits for mod in layers]
+    palette_list = [mod.palette      for mod in layers]
+
+    # All layers must share the same group_size (kernel constraint).
+    if group_size is None:
+        group_size = layers[0].group_size
+    for i, mod in enumerate(layers):
+        if mod.group_size != group_size:
+            raise ValueError(
+                f"All PalettizedLinears must share group_size for the "
+                f"batched compute_P_W kernel; layer {i} has "
+                f"group_size={mod.group_size} vs expected {group_size}"
+            )
+
+    mod_ext = _get_module()
+    flat = mod_ext.fused_compute_P_W_batched(
+        logits_list, palette_list, int(group_size),
+        float(tau), int(step_seed)
+    )
+    # flat is [P_aos_0, W_0, P_aos_1, W_1, ...] — zip consecutive pairs.
+    return [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
