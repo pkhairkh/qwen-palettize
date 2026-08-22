@@ -9,6 +9,14 @@ WAVE 2 (REVISED) — fused_soft_backward, performance-fixed:
     accumulation to reduce atomic contention. Replaces the 3.7 GB/s disaster
     with a proper memory-bound kernel targeting 200+ GB/s.
 
+PATCH 17 (buffer pooling):
+  The backward's intermediate grad_W (K,N) fp32 is drawn from a module-level
+  pool keyed on (K, N, device). grad_W is produced by fused_soft_bwd_grad_W_triton
+  and consumed immediately by fused_soft_bwd_elementwise_triton within the SAME
+  backward call — there is no autograd hazard (grad_W is never saved in ctx,
+  never returned upstream). grad_x, grad_logits, grad_palette are RETURNED to
+  autograd and CANNOT be pooled.
+
 Math (matches existing CUDA `fused_lut_linear_soft_bwd_fused_aos_kernel`):
   STE forward: y = x @ W_ste where W_ste = W_hard - W_soft.detach() + W_soft
                → forward value = W_hard; backward gradient flows through W_soft
@@ -328,6 +336,42 @@ def fused_soft_bwd_elementwise_kernel(
 # ═════════════════════════════════════════════════════════════════════════════
 # Python launchers
 # ═════════════════════════════════════════════════════════════════════════════
+# ── Patch 17: Buffer pooling for grad_W (backward intermediate) ─────────────
+# The backward's intermediate grad_W (K,N) fp32 = ~26-105 MB per layer (varies
+# with K,N). It is produced by fused_soft_bwd_grad_W_triton and consumed
+# immediately by fused_soft_bwd_elementwise_triton within the SAME backward
+# call — there is NO autograd hazard because grad_W is never saved in ctx and
+# never returned to upstream autograd.
+#
+# Pooling grad_W eliminates 25 torch.empty(K,N,fp32) calls per step + reduces
+# peak VRAM (the cached allocator can give back the same buffer immediately,
+# but the pool avoids the bookkeeping + fragmentation).
+#
+# Safety: grad_x, grad_logits, grad_palette are RETURNED to autograd and
+# CANNOT be pooled. Only grad_W (the internal intermediate) is pooled.
+_BWD_POOL_ENABLED = True
+_BWD_POOL: dict[tuple[int, int, int], torch.Tensor] = {}
+
+
+def _get_pooled_grad_W(K: int, N: int, device: torch.device) -> torch.Tensor:
+    """Returns a pooled (K, N) fp32 buffer for the grad_W intermediate.
+
+    Keyed on (K, N, device.index) to handle multi-GPU. Reused across backward
+    calls — no torch.empty allocation per call after warmup.
+    """
+    key = (K, N, device.index if device.type == "cuda" else -1)
+    buf = _BWD_POOL.get(key)
+    if buf is None:
+        buf = torch.empty((K, N), dtype=torch.float32, device=device)
+        _BWD_POOL[key] = buf
+    return buf
+
+
+def clear_bwd_pool() -> None:
+    """Releases all pooled grad_W buffers. Call on device change / shape change."""
+    _BWD_POOL.clear()
+
+
 def fused_soft_bwd_grad_x_triton(
     grad_y: torch.Tensor,    # (M, N) bf16
     W_ste: torch.Tensor,      # (K, N) bf16
@@ -340,6 +384,7 @@ def fused_soft_bwd_grad_x_triton(
     assert N == N2
     grad_y = grad_y.contiguous()
     W_ste = W_ste.contiguous()
+    # grad_x is RETURNED to autograd — cannot be pooled (would corrupt upstream).
     grad_x = torch.empty((M, K), dtype=torch.bfloat16, device=grad_y.device)
     grid = lambda meta: (triton.cdiv(M, meta["BM"]) * triton.cdiv(K, meta["BK"]),)
     fused_soft_bwd_grad_x_kernel[grid](
@@ -356,7 +401,13 @@ def fused_soft_bwd_grad_W_triton(
     x: torch.Tensor,        # (M, K) bf16
     grad_y: torch.Tensor,    # (M, N) bf16
 ) -> torch.Tensor:
-    """grad_W = x.T @ grad_y → (K, N) fp32 (kept in fp32 for elementwise kernel)."""
+    """grad_W = x.T @ grad_y → (K, N) fp32 (kept in fp32 for elementwise kernel).
+
+    Patch 17: grad_W is drawn from a module-level pool keyed on (K, N, device)
+    when _BWD_POOL_ENABLED. It is consumed immediately by
+    fused_soft_bwd_elementwise_triton within the same backward call — no
+    autograd hazard (never saved in ctx, never returned upstream).
+    """
     assert x.dtype == torch.bfloat16
     assert grad_y.dtype == torch.bfloat16
     M, K = x.shape
@@ -364,7 +415,10 @@ def fused_soft_bwd_grad_W_triton(
     assert M == M2
     x = x.contiguous()
     grad_y = grad_y.contiguous()
-    grad_W = torch.empty((K, N), dtype=torch.float32, device=x.device)
+    if _BWD_POOL_ENABLED:
+        grad_W = _get_pooled_grad_W(K, N, x.device)
+    else:
+        grad_W = torch.empty((K, N), dtype=torch.float32, device=x.device)
     grid = lambda meta: (triton.cdiv(K, meta["BM"]) * triton.cdiv(N, meta["BN"]),)
     fused_soft_bwd_grad_W_kernel[grid](
         x, grad_y, grad_W,
@@ -392,6 +446,7 @@ def fused_soft_bwd_elementwise_triton(
     grad_W = grad_W.contiguous()
     P_aos = P_aos.contiguous()
     palette = palette.contiguous()
+    # grad_logits and grad_palette are RETURNED to autograd — cannot be pooled.
     grad_logits = torch.empty((4, K, N), dtype=torch.float16, device=P_aos.device)
     grad_palette = torch.zeros((G, 4), dtype=torch.float32, device=palette.device)
     # LARGE block sizes — original 32×32 was launch-overhead-bound (3.7 GB/s = 0.4% peak).

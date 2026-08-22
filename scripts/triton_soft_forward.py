@@ -246,6 +246,62 @@ def fused_soft_matmul_kernel(
 # ═════════════════════════════════════════════════════════════════════════════
 # Python launchers
 # ═════════════════════════════════════════════════════════════════════════════
+# ── Patch 17: Buffer pooling for P_aos + W_ste ──────────────────────────────
+# A module-level pool keyed on (K, N, device.index) that reuses the same
+# P_aos (K,N,4) fp16 + W_ste (K,N) bf16 tensors across forward calls. This
+# eliminates ~50 torch.empty calls per step (2 per layer × 25 layers) +
+# associated CUDA caching-allocator bookkeeping.
+#
+# SAFETY INVARIANT (must hold for correctness):
+#   Pooling is only safe under the standard training pattern:
+#       forward → loss → backward → (graph freed) → next forward
+#   The pooled P_aos + W_ste are saved via ctx.save_for_backward in
+#   TritonSoftLinear.forward. They must NOT be modified in-place after being
+#   saved, until the corresponding backward has consumed them. Because the
+#   backward of step N completes (and frees the graph) before step N+1's
+#   forward starts, the next compute_P_W_ste_kernel write always lands AFTER
+#   the previous backward's read. Triton tl.store bypasses PyTorch's
+#   in-place modification detection (version counter), so corruption would
+#   be SILENT if this invariant were violated (e.g. retain_graph=True across
+#   steps). The training code (train_qwen.py) does NOT use retain_graph.
+#
+#   grad_x, grad_logits, grad_palette are RETURNED to autograd and CANNOT
+#   be pooled — they flow into upstream layers / optimizer state. Only the
+#   intermediate grad_W in the backward is pooled (see triton_soft_backward.py).
+#
+# To disable pooling (e.g. for debugging), set _POOLING_ENABLED = False.
+_POOLING_ENABLED = True
+_P_POOL: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
+
+
+def _get_pooled_buffers(K: int, N: int, device: torch.device) -> dict[str, torch.Tensor]:
+    """Returns pooled P_aos (K,N,4) fp16 + W_ste (K,N) bf16 buffers.
+
+    Allocates on first call for a given (K, N, device); reuses thereafter.
+    Keyed on (K, N, device.index) to handle multi-GPU.
+    """
+    key = (K, N, device.index if device.type == "cuda" else -1)
+    bufs = _P_POOL.get(key)
+    if bufs is None:
+        bufs = {
+            "P_aos": torch.empty((K, N, 4), dtype=torch.float16, device=device),
+            "W_ste": torch.empty((K, N), dtype=torch.bfloat16, device=device),
+        }
+        _P_POOL[key] = bufs
+    return bufs
+
+
+def clear_P_pool() -> None:
+    """Releases all pooled P_aos + W_ste buffers.
+
+    Call this when:
+      - The model is moved to a different device
+      - Training resumes from a checkpoint with different shapes
+      - Memory pressure requires reclaiming the pool (~1.3 GB for 25 layers)
+    """
+    _P_POOL.clear()
+
+
 def compute_P_W_ste_triton(
     logits: torch.Tensor,
     palette: torch.Tensor,
@@ -257,6 +313,11 @@ def compute_P_W_ste_triton(
 
     Patch 16: W_soft is NOT returned — the backward recomputes it on-the-fly
     from P_aos + palette (see fused_soft_bwd_elementwise_kernel).
+
+    Patch 17: P_aos + W_ste are drawn from a module-level pool keyed on
+    (K, N, device) when _POOLING_ENABLED. The kernel writes into the pooled
+    buffers in-place — no torch.empty allocation per call after warmup.
+    See _P_POOL docstring for the safety invariant.
     """
     assert logits.dtype == torch.float16, f"logits must be fp16, got {logits.dtype}"
     assert palette.dtype == torch.bfloat16, f"palette must be bf16, got {palette.dtype}"
@@ -268,8 +329,13 @@ def compute_P_W_ste_triton(
 
     logits = logits.contiguous()
     palette = palette.contiguous()
-    P_aos = torch.empty((K, N, 4), dtype=torch.float16, device=logits.device)
-    W_ste = torch.empty((K, N), dtype=torch.bfloat16, device=logits.device)
+    if _POOLING_ENABLED:
+        bufs = _get_pooled_buffers(K, N, logits.device)
+        P_aos = bufs["P_aos"]
+        W_ste = bufs["W_ste"]
+    else:
+        P_aos = torch.empty((K, N, 4), dtype=torch.float16, device=logits.device)
+        W_ste = torch.empty((K, N), dtype=torch.bfloat16, device=logits.device)
 
     grid = lambda meta: (triton.cdiv(K, meta["BM"]), triton.cdiv(N, meta["BN"]))
     compute_P_W_ste_kernel[grid](
