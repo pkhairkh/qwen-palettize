@@ -88,3 +88,71 @@ Stage Summary:
   - Wave 3 (9a/9b/9c): commits 02cff8e + 1c03465 + final PROGRESS commit
 - Branch ready for orchestrator merge to main (merge order: optimizer-streams LAST, after nn-module-foundation + training-recipe + kernels).
 
+
+---
+Task ID: 11-read
+Agent: nn-module-foundation
+Task: Clone repo on agent/nn-module-foundation branch, read ROADMAP/PROGRESS/RULES/TASKS + research + source files (qwen_model.py PalettizedLinear + PartialModel, train_qwen.py build_student_super_block + FP32MasterOptimizer) to gather context before Wave 1.
+
+Work Log:
+- Cloned branch `agent/nn-module-foundation` from `pkhairkh/qwen-palettize.git` (HEAD = f2e216b "Round 3 multi-agent infrastructure for full Triton fusion").
+- Read `agent-ctx/ROADMAP.md` — 6 agents / 17 patches (P10-P26) / 4 waves. I am the FOUNDATION agent (Patch 11). Merge order: nn-module → triton-kernels → layer-fusion → lora-fusion → quality-recipe → cuda-graphs.
+- Read `agent-ctx/PROGRESS.md` — all 6 agents ⬜ Pending, no merges yet. Patch 11 row ⬜.
+- Read `agent-ctx/agent-nn-module-foundation/TASKS.md` + `RULES.md`. My exclusive territory: qwen_model.py lines 47-48, 65-180, 438-600, 779-850; train_qwen.py lines 154-214, 540-600, 632-736. Triton kernels (triton_*.py) are NOT mine.
+- Read inbox (`agent-nn-module-foundation/inbox/1724371200-from-orchestrator.md`) — orchestrator confirms Wave 1 assignment, start Patch 11. No messages from other agents.
+- Read `research-architecture-review/02_partial_wrapper_problem.md` — full diagnosis of the PartialWrapper problem (was a plain Python class, broke torch.compile / state_dict / FSDP / accelerate / Trainer). Fix = inherit from nn.Module + use nn.ModuleList.
+- Read `scripts/qwen_model.py`:
+  - PalettizedLinear (lines 65-209): `forward(self, x)` at lines 147-196. Triton path / CUDA C path / PyTorch fallback. Triton kernel signatures `triton_soft_linear(x, palette, logits, bias, group_size, tau)` and `triton_hard_linear(x, palette, indices_int8, bias, group_size)` do NOT accept `out_norm` yet (that's layer-fusion's Patch 10 job).
+  - PartialModel (lines 481-530): ALREADY inherits from `nn.Module`, uses `nn.ModuleList(layers)`, calls `super().__init__()`. Patch 9 (Round 1) already did the refactor.
+  - PartialWrapper (lines 533-555): ALREADY inherits from `nn.Module`, delegates to wrapped PartialModel.
+- Read `scripts/train_qwen.py`:
+  - FP32MasterOptimizer (lines 154-210): pre-allocates fp32 grad buffers (already optimized in Round 2). My territory but already in good shape.
+  - build_optimizers (lines 559-635): per-group LR, Muon + FP32MasterAdamW + bnb.optim.AdamW8bit. Already complete.
+  - build_student_super_block (lines 682-809): returns `PartialWrapper` (an nn.Module). No dynamic shapes in forward — forward is called via `model.model.embed_tokens(batch_ids)` + per-layer `model.model.layers[i](h, position_embeddings=pos_emb)`. PartialWrapper.forward(input_ids, position_ids) exists but training loop calls layers directly for streaming.
+
+Stage Summary:
+- Wave 1 prerequisites satisfied. No inbox messages from other agents — no blockers.
+- Key findings:
+  - PartialModel/PartialWrapper already nn.Module subclasses (Patch 9 done). Sub-task 11b is verification only — no code change needed.
+  - build_student_super_block returns a proper nn.Module. No data-dependent control flow in forward (super-block layer count is fixed at construction time). Sub-task 11c is verification + documentation only.
+  - PalettizedLinear.forward currently takes only `x`. Sub-task 11a is the only real code change.
+- Plan for 11a: add `out_norm=None` parameter, apply RMSNorm eagerly when provided (functional fallback). The layer-fusion agent (Patch 10) will replace the eager RMSNorm with a fused Triton kernel call (`triton_soft_linear(..., out_norm=out_norm)`).
+
+---
+Task ID: 11-wave1
+Agent: nn-module-foundation
+Task: Wave 1 — Patch 11 (nn.Module forward signature for fused RMSNorm). DoD: add out_norm parameter to PalettizedLinear.forward, verify PartialModel delegates to nn.ModuleList, verify build_student_super_block torch.compile-compatible, send inbox message to layer-fusion, update PROGRESS.md, push branch.
+
+Work Log:
+- Sub-task 11a (commit 970f5ad): Added module-level helper `_apply_rmsnorm_eager(x, weight, eps=1e-6)` at qwen_model.py:66-93 — computes RMSNorm in eager mode (fp32 variance for stability, cast back to x's dtype). Formula matches HF Qwen3_5RMSNorm. Updated `PalettizedLinear.forward` signature from `forward(self, x)` to `forward(self, x, out_norm=None)`. When `out_norm` is provided, applies `_apply_rmsnorm_eager` to `x_flat` before dispatching to the Triton / CUDA C / PyTorch fallback path. Default `None` preserves backward compatibility — all existing call sites (QwenLoRA.forward, _palettized_lora_forward, training loop) work unchanged. Added comprehensive docstring documenting the layer-fusion agent's Patch 10 follow-up (replace eager RMSNorm with fused Triton kernel call that accepts out_norm directly). Syntax check PASS via ast.parse. AST inspection confirms forward args=['self','x','out_norm'] with default=None.
+- Sub-task 11b (commit e3d9f90): Verified (offline, via AST inspection — no torch import needed) that PartialModel and PartialWrapper are already proper nn.Module subclasses (Patch 9, Round 1):
+  - PartialModel(nn.Module) — inherits nn.Module, calls super().__init__(), stores layers as nn.ModuleList(layers). No hand-rolled parameters/named_parameters/named_modules/to/eval/train/get_submodule/state_dict/load_state_dict — all inherited from nn.Module.
+  - PartialWrapper(nn.Module) — inherits nn.Module, calls super().__init__(), wraps PartialModel as self.model submodule. forward(input_ids, position_ids) delegates to self.model(...).
+  Added a verification note to the existing PartialModel/PartialWrapper comment block (qwen_model.py:549-568). No code changes — verification only.
+- Sub-task 11c (commit c516401): Verified (offline, via AST inspection) that build_student_super_block is torch.compile-compatible:
+  - Returns (model, tokenizer) where model is a PartialWrapper (nn.Module). Verified by tracing the call chain: build_student_super_block → load_qwen_super_block_only → PartialWrapper(partial, config).
+  - No data-dependent control flow in any forward path. Audited PartialWrapper.forward, PartialModel.forward, PalettizedLinear.forward — none contain .item() / .numpy() / int(tensor) / float(tensor) calls (which would cause graph breaks). All branches are on module attributes (self.training, self._use_triton, self.use_soft_indices, self.pre_transposed, self.index_logits is not None, self.bias is not None, out_norm is not None) or tensor metadata (x_flat.is_cuda, orig_ndim == 3).
+  - Dynamic shapes OK: batch_size and seq_len can vary; number of layers is FIXED at construction (super-block = 4 layers + 1 correction).
+  Documented two follow-up notes for downstream agents in the build_student_super_block docstring (train_qwen.py:682-753):
+  1. ⚠ self.tau retracing — tau is annealed during training; torch.compile will retrace when tau changes. Layer-fusion agent can pass tau as a 0-dim tensor to avoid retracing.
+  2. ⚠ Stream double-buffer — training loop calls model.model.layers[i](h, ...) directly instead of model(input_ids). Recommended fix for cuda-graphs agent: compile individual layers via torch.compile(model.model.layers[i]).
+- Sub-task 11d (this commit): Sent inbox message to layer-fusion at agent-ctx/agent-layer-fusion/inbox/1787433396-from-nn-module-foundation.md — subject "Patch 11 done — forward signature ready for fused RMSNorm (Patch 10)". Message includes: new forward signature, current eager fallback behavior, exact Patch 10 integration steps (extend triton_soft_linear/triton_hard_linear signatures, fuse RMSNorm into kernel prologue, replace eager call with kernel call, remove _apply_rmsnorm_eager helper), backward compatibility notes, torch.compile compatibility summary, DoD checklist, commit list. Updated agent-ctx/PROGRESS.md: nn-module-foundation Wave 1 ✅ Done, Patch 11 ✅ Done (commits 970f5ad + e3d9f90 + c516401 + Wave 1 closeout), event log entry added, inbox summary updated for layer-fusion.
+
+Stage Summary:
+- Wave 1 DoD fully met:
+  [x] python3 -c "import ast; ast.parse(open('scripts/qwen_model.py').read())" passes
+  [x] python3 -c "import ast; ast.parse(open('scripts/train_qwen.py').read())" passes
+  [x] PalettizedLinear.forward accepts optional out_norm parameter (default None)
+  [x] PartialModel properly delegates to nn.ModuleList(layers)
+  [x] Inbox message sent to layer-fusion (agent-ctx/agent-layer-fusion/inbox/1787433396-from-nn-module-foundation.md)
+  [x] Branch pushed to origin/agent/nn-module-foundation
+- All 4 sub-tasks complete:
+  - 11a: commit 970f5ad (real code change — added out_norm param + _apply_rmsnorm_eager helper)
+  - 11b: commit e3d9f90 (verification + comment update)
+  - 11c: commit c516401 (verification + docstring with torch.compile audit)
+  - 11d: this commit (inbox message + PROGRESS.md update + push)
+- File ownership respected:
+  - qwen_model.py: only lines 47-48 (untouched), 65-180 (PalettizedLinear — added _apply_rmsnorm_eager at 66-93, updated forward at 178-272), 438-600 (PartialModel/PartialWrapper — comment update at 549-568), 779-850 (untouched). NO changes to QwenLoRA class (184-265 — lora-fusion territory) or triton_*.py (triton-kernels territory).
+  - train_qwen.py: only lines 632-736 (build_student_super_block docstring at 682-753). NO changes to 96-102 (quality-recipe), 889-918 (cuda-graphs), 1034-1040 (quality-recipe), 1058-1250 (cuda-graphs).
+- Branch ready for orchestrator merge to main (merge order: nn-module FIRST, then triton-kernels → layer-fusion → lora-fusion → quality-recipe → cuda-graphs).
+- Layer-fusion agent can start Patch 10 (fused RMSNorm + Linear) immediately — either rebase on agent/nn-module-foundation, or wait for orchestrator merge to main.
