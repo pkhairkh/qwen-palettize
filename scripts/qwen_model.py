@@ -296,9 +296,29 @@ class QwenLoRA(nn.Module):
             x_flat = x.reshape(-1, x.shape[-1])
         else:
             x_flat = x
-        # fp16 matmul
-        lora_out = (x_flat @ self.lora_A) @ self.lora_B.T
-        lora_out = lora_out * self.scaling
+        # Patch 19 (lora-fusion): try Triton fused LoRA kernel first.
+        # The fused kernel computes y = (x @ A) @ B.T * scaling in a single
+        # autograd node, with scaling fused into the output store (eliminates
+        # 31 aten::mul per step) and with cached xA = x @ A shared with the
+        # backward (eliminates one full M*K*R recompute per LoRA module).
+        # Falls back to PyTorch matmul when Triton is unavailable or when
+        # dtypes/device do not match (CPU, fp32, etc.).
+        if (x_flat.is_cuda
+                and self.lora_A.dtype == torch.bfloat16
+                and self.lora_B.dtype == torch.bfloat16
+                and x_flat.dtype == torch.bfloat16):
+            try:
+                from triton_lora import triton_lora_forward as _triton_lora_fwd
+                lora_out = _triton_lora_fwd(x_flat, self.lora_A, self.lora_B, self.scaling)
+            except Exception:
+                # Triton path failed (e.g. import error, JIT compile error,
+                # autotune cache miss). Fall back to PyTorch matmul.
+                lora_out = (x_flat @ self.lora_A) @ self.lora_B.T
+                lora_out = lora_out * self.scaling
+        else:
+            # Fallback: PyTorch matmul (CPU / non-bf16 / no Triton)
+            lora_out = (x_flat @ self.lora_A) @ self.lora_B.T
+            lora_out = lora_out * self.scaling
         if orig_ndim == 3:
             lora_out = lora_out.reshape(B_, S_, -1)
         return y_base + lora_out
