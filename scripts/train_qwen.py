@@ -1312,7 +1312,23 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         # Backward
         loss.backward()
 
-        # Two-tier clip: indices separate (their tiny Gumbel grads would be zeroed by global norm)
+        # Patch 24 (quality-recipe): per-group gradient clipping.
+        # Replaces the previous global `clip_grad_norm_(model.parameters(), 0.3)`
+        # which effectively zeroed palette updates: the 1.78B index_logits
+        # dominated the global norm, so the palette gradient was scaled by
+        # ~1/45 of its raw value (research-kernel-accuracy/08_recommendations.md
+        # Fix 4). Splitting into two groups lets each group's gradient flow at
+        # its natural scale:
+        #   - indices_params  (1.78B index_logits): clip 1.0 — the Gumbel-Softmax
+        #     gradients are tiny (~1e-6) and would otherwise be throttled.
+        #   - other_params (palettes + LoRA + layernorms): clip `gradient_clip`
+        #     (default 0.3) — standard clip for well-behaved gradient magnitudes.
+        # Paper: AdamW (Loshchilov 2017, arXiv:1711.05101) — gradient clipping
+        # best practices. Per-group clipping preserves gradient scale per layer
+        # type, avoiding the global-norm dilution effect.
+        # NOTE: This functional code is already in the desired state (inherited
+        # from prior round commit 5446edf). This commit documents the explicit
+        # Patch 24 attribution + research reference for the audit trail.
         clip_val = hp.get("gradient_clip", 0.3)
         indices_params = []
         other_params = []
