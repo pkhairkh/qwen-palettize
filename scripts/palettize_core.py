@@ -23,14 +23,7 @@ from palettize_pytorch import (
 )
 
 BITWIDTH = 2
-GROUP_SIZE = 128  # Halved from 256 for better k-means fit (GPTQ/AWQ standard).
-                  # See research-filter-consolidation/01_training_recipe.md §4
-                  # and docs/papers/2210.17323_GPTQ_Frantar2023.pdf (GS=128 standard).
-                  # Larger group = more weight diversity within the group = 4-entry
-                  # k-means codebook fits worse. Halving roughly halves within-group
-                  # diversity. Expected: mean cos 0.937 -> 0.945-0.950 at calibration.
-                  # NOTE: existing checkpoints (calibrated with GS=256) are INCOMPATIBLE
-                  # and must be re-calibrated (run calib_qwen.py) before resuming training.
+GROUP_SIZE = 256
 PALETTE_SIZE = 1 << BITWIDTH
 
 
