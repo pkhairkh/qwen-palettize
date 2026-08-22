@@ -93,8 +93,20 @@ DEFAULT_HYPERPARAMS = {
         "correction": 2e-4,
         "layernorms": 3e-4,
     },
-    "loss_type": "norm_mse",
-    "loss_weights": {"cos": 0.0, "mse": 1.0},
+    # Patch 23 (quality-recipe): switch from pure `norm_mse` (which conflates
+    # magnitude and direction errors and plateaus at cos≈0.95) to the combined
+    # `1-cos+norm_mse` with an 80/20 weighting.
+    #   - `cos=0.8`: explicitly optimizes the direction metric we care about.
+    #     Direction is the typical remaining error after k-means calibration
+    #     (k-means preserves cluster means, so magnitudes are already correct).
+    #   - `mse=0.2`: provides a stable magnitude gradient at training start
+    #     (the `1-cos` term is ill-conditioned when ||s||→0 due to its 1/||s||
+    #     denominator; the `mse` term has ||t|| in the denominator and is safe).
+    # See research-palettes-training/05_loss_function.md §5 and
+    # docs/papers/2210.17323_GPTQ_Frantar2023.pdf + 2305.14314_QLoRA_Dettmers2023.pdf.
+    # Expected: breaks the cos=0.946 plateau → cos 0.96-0.97 within 2000 steps.
+    "loss_type": "1-cos+norm_mse",
+    "loss_weights": {"cos": 0.8, "mse": 0.2},
     "gradient_clip": 0.3,
     "eval_every": 250,
     "log_every": 50,
