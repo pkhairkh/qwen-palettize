@@ -1724,3 +1724,169 @@ void fused_lut_linear_soft_bwd_fused_Launcher(
         grad_palette,
         M, K, N, group_size);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PHASE IX.b (AoS) — Fused soft backward kernel reading (K, N, 4) P
+//
+//  Patch 5b — re-enable the fused bwd path. The SoA variant above was
+//  disabled because its 4 strided loads to P[k * plane_size + idx] for
+//  k = 0..3 each touched a separate L2 cache line 26 MB apart, making
+//  the kernel 3.8× slower than the PyTorch elementwise path despite the
+//  PyTorch path materialising a (K, N, 4) fp32 intermediate.
+//
+//  This variant reads P_aos[idx * 4 + 0..3] — 4 adjacent fp16 values (8
+//  bytes total) which the warp coalesces into a single 64-bit LDG.E.U64.
+//
+//  Block: (16, 16) = 256 threads. Each thread owns 1 (j, o).
+//  M-reduction still uses the smem-cached chunks of x and grad_y.
+//  Smem: 8 KB per block (4 KB sx_chunk + 4 KB sgy_chunk).
+//
+//  Inputs:
+//    grad_y:    (M, N) bf16
+//    x:         (M, K) bf16
+//    P_aos:     (K, N, 4) fp16  — AoS layout, contiguous last-dim
+//    palette:   (G, 4)    bf16
+//
+//  Outputs:
+//    grad_logits:  (4, K, N) fp16  — OUTPUT stays SoA (optimizer expects this)
+//    grad_palette: (G, 4)    fp32  — atomicAdd target
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void fused_lut_linear_soft_bwd_fused_aos_kernel(
+    const __nv_bfloat16* __restrict__ grad_y,    // (M, N) bf16
+    const __nv_bfloat16* __restrict__ x,         // (M, K) bf16
+    const __half*        __restrict__ P_aos,      // (K, N, 4) fp16 — AoS INPUT
+    const __nv_bfloat16* __restrict__ palette,   // (G, 4)    bf16
+    __half*              __restrict__ grad_logits, // (4, K, N) fp16 — OUTPUT stays SoA
+    float*               __restrict__ grad_palette, // (G, 4)    fp32 — atomicAdd output
+    int M, int K, int N, int group_size
+) {
+    // Smem: sx_chunk[128][16] = 4 KB, sgy_chunk[128][16] = 4 KB → 8 KB total
+    __shared__ __nv_bfloat16 sx_chunk[SOFT_BWD_BM_CHUNK][SOFT_BWD_BK];
+    __shared__ __nv_bfloat16 sgy_chunk[SOFT_BWD_BM_CHUNK][SOFT_BWD_BN];
+
+    const int tk = threadIdx.x;   // 0..15 → j direction
+    const int tn = threadIdx.y;   // 0..15 → o direction
+    const int tid = tn * 16 + tk;
+
+    const int j = blockIdx.x * SOFT_BWD_BK + tk;
+    const int o = blockIdx.y * SOFT_BWD_BN + tn;
+    if (j >= K || o >= N) return;
+
+    const int g = o / group_size;
+    const int idx = j * N + o;
+    const int plane_size = K * N;
+
+    // ── Step 1: Compute grad_W[j, o] = Σ_i x[i, j] * grad_y[i, o] ──────────
+    // Loop over M in chunks of BM_CHUNK=128, accumulate in register.
+    float grad_W = 0.0f;
+
+    for (int m_chunk = 0; m_chunk < M; m_chunk += SOFT_BWD_BM_CHUNK) {
+        // Cooperatively load sx_chunk[BM_CHUNK][BK] = 128*16 = 2048 bf16 = 4 KB
+        // 256 threads × 8 bf16 = 2048 (each thread loads 1 int4 = 8 bf16)
+        {
+            const int off = tid * 8;
+            const int r = off / SOFT_BWD_BK;       // 0..127 (row in chunk)
+            const int c = off % SOFT_BWD_BK;       // 0..8 (col, mult of 8)
+            const int gm = m_chunk + r;
+            const int gk = blockIdx.x * SOFT_BWD_BK + c;
+            if (gm < M && gk + 8 <= K) {
+                const int4* src = reinterpret_cast<const int4*>(&x[gm * K + gk]);
+                int4 v = __ldg(src);
+                *reinterpret_cast<int4*>(&sx_chunk[r][c]) = v;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int cc = c + i;
+                    const bool ok = (m_chunk + r < M) && (blockIdx.x * SOFT_BWD_BK + cc < K);
+                    sx_chunk[r][cc] = ok ? x[(m_chunk + r) * K + (blockIdx.x * SOFT_BWD_BK + cc)]
+                                          : __float2bfloat16(0.0f);
+                }
+            }
+        }
+
+        // Cooperatively load sgy_chunk[BM_CHUNK][BN] = 128*16 = 2048 bf16 = 4 KB
+        {
+            const int off = tid * 8;
+            const int r = off / SOFT_BWD_BN;
+            const int c = off % SOFT_BWD_BN;
+            const int gm = m_chunk + r;
+            const int gn = blockIdx.y * SOFT_BWD_BN + c;
+            if (gm < M && gn + 8 <= N) {
+                const int4* src = reinterpret_cast<const int4*>(&grad_y[gm * N + gn]);
+                int4 v = __ldg(src);
+                *reinterpret_cast<int4*>(&sgy_chunk[r][c]) = v;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int cc = c + i;
+                    const bool ok = (m_chunk + r < M) && (blockIdx.y * SOFT_BWD_BN + cc < N);
+                    sgy_chunk[r][cc] = ok ? grad_y[(m_chunk + r) * N + (blockIdx.y * SOFT_BWD_BN + cc)]
+                                            : __float2bfloat16(0.0f);
+                }
+            }
+        }
+        __syncthreads();
+
+        // Each thread accumulates its grad_W[j, o] partial sum
+        #pragma unroll
+        for (int i = 0; i < SOFT_BWD_BM_CHUNK; ++i) {
+            float xv = __bfloat162float(sx_chunk[i][tk]);
+            float gv = __bfloat162float(sgy_chunk[i][tn]);
+            grad_W += xv * gv;
+        }
+        __syncthreads();
+    }
+
+    // ── Step 2: Load P[j, o, 0..3] — AoS, COALESCED ─────────────────────────
+    // Patch 5b fix: 4 adjacent fp16 values, single 64-bit LDG.E.U64 per thread
+    // (vs 4 strided 26-MB-apart LDG.E.U16 in the SoA variant).
+    const int idx_aos = idx * 4;
+    float p0 = __half2float(P_aos[idx_aos + 0]);
+    float p1 = __half2float(P_aos[idx_aos + 1]);
+    float p2 = __half2float(P_aos[idx_aos + 2]);
+    float p3 = __half2float(P_aos[idx_aos + 3]);
+
+    // ── Step 2b: Load palette[g, 0..3] ──────────────────────────────────────
+    float c0 = __bfloat162float(palette[g * 4 + 0]);
+    float c1 = __bfloat162float(palette[g * 4 + 1]);
+    float c2 = __bfloat162float(palette[g * 4 + 2]);
+    float c3 = __bfloat162float(palette[g * 4 + 3]);
+
+    // ── Step 3: Reconstruct W[j, o] = Σ_k P[k] * palette[g, k] ──────────────
+    float W_val = c0 * p0 + c1 * p1 + c2 * p2 + c3 * p3;
+
+    // ── Step 4: grad_logits[j, o, k] = grad_W * P[k] * (palette[g, k] - W) ─
+    // grad_logits OUTPUT stays (4, K, N) SoA — optimizer + checkpoint format
+    // expect this layout, so we pay 4 strided STG here (acceptable, write-once).
+    grad_logits[0 * plane_size + idx] = __float2half(grad_W * p0 * (c0 - W_val));
+    grad_logits[1 * plane_size + idx] = __float2half(grad_W * p1 * (c1 - W_val));
+    grad_logits[2 * plane_size + idx] = __float2half(grad_W * p2 * (c2 - W_val));
+    grad_logits[3 * plane_size + idx] = __float2half(grad_W * p3 * (c3 - W_val));
+
+    // ── Step 5: grad_palette[g, k] += grad_W * P[k]  (atomicAdd) ────────────
+    atomicAdd(&grad_palette[g * 4 + 0], grad_W * p0);
+    atomicAdd(&grad_palette[g * 4 + 1], grad_W * p1);
+    atomicAdd(&grad_palette[g * 4 + 2], grad_W * p2);
+    atomicAdd(&grad_palette[g * 4 + 3], grad_W * p3);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Launcher for fused soft backward AoS kernel
+// ─────────────────────────────────────────────────────────────────────────────
+void fused_lut_linear_soft_bwd_fused_aos_Launcher(
+    const c10::BFloat16* grad_y, const c10::BFloat16* x,
+    const c10::Half* P_aos, const c10::BFloat16* palette,
+    c10::Half* grad_logits, float* grad_palette,
+    int M, int K, int N, int group_size
+) {
+    dim3 grid((K + SOFT_BWD_BK - 1) / SOFT_BWD_BK, (N + SOFT_BWD_BN - 1) / SOFT_BWD_BN);
+    dim3 block(SOFT_BWD_BK, SOFT_BWD_BN);   // (16, 16) = 256 threads
+    fused_lut_linear_soft_bwd_fused_aos_kernel<<<grid, block, 0, 0>>>(
+        reinterpret_cast<const __nv_bfloat16*>(grad_y),
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const __half*>(P_aos),
+        reinterpret_cast<const __nv_bfloat16*>(palette),
+        reinterpret_cast<__half*>(grad_logits),
+        grad_palette,
+        M, K, N, group_size);
+}
