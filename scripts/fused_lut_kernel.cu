@@ -1352,6 +1352,83 @@ __global__ void fused_lut_linear_soft_compute_P_W_kernel(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Soft compute_P_W kernel — AoS P output (K, N, 4)
+//
+//  Patch 5a — same math as `fused_lut_linear_soft_compute_P_W_kernel`
+//  above, but writes P in (K, N, 4) Array-of-Structures layout so that the
+//  4 probabilities for one (j, o) are ADJACENT in memory. This lets the
+//  backward kernel replace 4 strided 26-MB-apart loads with a single
+//  coalesced 64-bit LDG (4 × fp16 = 8 bytes per (j, o)).
+//
+//  INPUTS (unchanged from SoA variant):
+//    logits:   (4, K, N) fp16 — SoA layout (training parameter, optimizer
+//              state expects this; we do NOT change the logits layout)
+//    palette:  (G, 4) bf16
+//
+//  OUTPUTS:
+//    P_aos:    (K, N, 4) fp16 — AoS layout, contiguous last-dim
+//    W_out:    (K, N) bf16
+//
+//  Block: (16, 16) = 256 threads. Each thread handles one (j, o) element.
+//  Grid:  (cdiv(K, 16), cdiv(N, 16)).
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void fused_lut_linear_soft_compute_P_W_aos_kernel(
+    const __half*        __restrict__ logits,    // (4, K, N) fp16 — INPUT stays SoA
+    const __nv_bfloat16* __restrict__ palette,   // (G, 4)    bf16
+    __half*              __restrict__ P_aos,     // (K, N, 4) fp16 — OUTPUT is AoS
+    __nv_bfloat16*       __restrict__ W_out,     // (K, N)    bf16
+    int K, int N, int group_size,
+    float tau, uint32_t step_seed
+) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int o = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= K || o >= N) return;
+
+    const int g = o / group_size;
+    const int idx      = j * N + o;          // index into a (K, N) plane
+    const int idx_aos  = idx * 4;            // index into AoS P (K, N, 4)
+    const int plane_size = K * N;
+
+    // ── Load 4 logits from SoA layout (4 reads, ONE per element — bandwidth-light)
+    float l0 = __half2float(logits[0 * plane_size + idx]);
+    float l1 = __half2float(logits[1 * plane_size + idx]);
+    float l2 = __half2float(logits[2 * plane_size + idx]);
+    float l3 = __half2float(logits[3 * plane_size + idx]);
+
+    // ── Add Gumbel noise + divide by tau (same LCG as the SoA variant)
+    float inv_tau = 1.0f / tau;
+    float n0 = (l0 + gumbel_sample(step_seed, idx * 4 + 0)) * inv_tau;
+    float n1 = (l1 + gumbel_sample(step_seed, idx * 4 + 1)) * inv_tau;
+    float n2 = (l2 + gumbel_sample(step_seed, idx * 4 + 2)) * inv_tau;
+    float n3 = (l3 + gumbel_sample(step_seed, idx * 4 + 3)) * inv_tau;
+
+    // ── Softmax (numerically stable)
+    float m = fmaxf(fmaxf(n0, n1), fmaxf(n2, n3));
+    float e0 = expf(n0 - m);
+    float e1 = expf(n1 - m);
+    float e2 = expf(n2 - m);
+    float e3 = expf(n3 - m);
+    float s = e0 + e1 + e2 + e3;
+    float p0 = e0 / s, p1 = e1 / s, p2 = e2 / s, p3 = e3 / s;
+
+    // ── Write P_aos (K, N, 4) — 4 adjacent fp16 values
+    // Adjacent threads write adjacent (j, o) elements, each 8 bytes — coalesced
+    // 64-bit STG across the warp. Equivalent to one __half4 store.
+    P_aos[idx_aos + 0] = __float2half(p0);
+    P_aos[idx_aos + 1] = __float2half(p1);
+    P_aos[idx_aos + 2] = __float2half(p2);
+    P_aos[idx_aos + 3] = __float2half(p3);
+
+    // ── Compute W = Σ_k P[k] * palette[g, k]
+    float c0 = __bfloat162float(palette[g * 4 + 0]);
+    float c1 = __bfloat162float(palette[g * 4 + 1]);
+    float c2 = __bfloat162float(palette[g * 4 + 2]);
+    float c3 = __bfloat162float(palette[g * 4 + 3]);
+    float W_val = p0 * c0 + p1 * c1 + p2 * c2 + p3 * c3;
+    W_out[idx] = __float2bfloat16(W_val);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Soft backward — grad_logits kernel
 //
 //  grad_logits[j, o, k] = grad_W[j, o] * P[j, o, k] * (palette[g, k] - W[j, o])
@@ -1447,6 +1524,24 @@ void fused_lut_linear_soft_compute_P_W_Launcher(
         reinterpret_cast<const __half*>(logits),
         reinterpret_cast<const __nv_bfloat16*>(palette),
         reinterpret_cast<__half*>(P),
+        reinterpret_cast<__nv_bfloat16*>(W_out),
+        K, N, group_size, tau, step_seed);
+}
+
+// Patch 5a — Launcher for the AoS-output compute_P_W kernel.
+// P_aos is allocated by the caller as a (K*N*4,) fp16 buffer with the
+// expected logical shape (K, N, 4) AoS.
+void fused_lut_linear_soft_compute_P_W_aos_Launcher(
+    const c10::Half* logits, const c10::BFloat16* palette,
+    c10::Half* P_aos, c10::BFloat16* W_out,
+    int K, int N, int group_size, float tau, uint32_t step_seed
+) {
+    dim3 grid((K + 15) / 16, (N + 15) / 16);
+    dim3 block(16, 16);
+    fused_lut_linear_soft_compute_P_W_aos_kernel<<<grid, block, 0, 0>>>(
+        reinterpret_cast<const __half*>(logits),
+        reinterpret_cast<const __nv_bfloat16*>(palette),
+        reinterpret_cast<__half*>(P_aos),
         reinterpret_cast<__nv_bfloat16*>(W_out),
         K, N, group_size, tau, step_seed);
 }
