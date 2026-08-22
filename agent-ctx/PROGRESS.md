@@ -8,12 +8,12 @@
 
 | Agent | Branch | Wave 1 | Wave 2 | Wave 3 | Wave 4 | Merged |
 |-------|--------|--------|--------|--------|--------|--------|
-| nn-module-foundation | `agent/nn-module-foundation` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| triton-kernels | `agent/triton-kernels` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| layer-fusion | `agent/layer-fusion` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
+| nn-module-foundation | `agent/nn-module-foundation` | 🔄 In Progress | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
+| triton-kernels | `agent/triton-kernels` | ✅ Done | 🔄 In Progress | ⬜ Pending | ⬜ Pending | ⬜ |
+| layer-fusion | `agent/layer-fusion` | 🔄 In Progress | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | lora-fusion | `agent/lora-fusion` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | cuda-graphs | `agent/cuda-graphs` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| quality-recipe | `agent/quality-recipe` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
+| quality-recipe | `agent/quality-recipe` | 🔄 In Progress | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 
 **Legend:** ⬜ Pending | 🔄 In Progress | ✅ Done | ❌ Blocked
 
@@ -35,22 +35,22 @@
 | # | Patch | Agent | Status | Branch | Commit |
 |---|-------|-------|--------|--------|--------|
 | 10 | Fused RMSNorm + Linear | layer-fusion | ⬜ | — | — |
-| 11 | nn.Module forward signature | nn-module-foundation | ⬜ | — | — |
+| 11 | nn.Module forward signature | nn-module-foundation | 🔄 | agent/nn-module-foundation | 970f5ad |
 | 12 | Fused MLP (gate+up+SiLU+down) | layer-fusion | ⬜ | — | — |
 | 13 | Fused Attention (FlashAttention-style) | layer-fusion | ⬜ | — | — |
 | 14 | Fused GatedDeltaNet (conv1d + delta-rule) | layer-fusion | ⬜ | — | — |
-| 15 | Batched compute_P_W (Triton, 25→1) | triton-kernels | ⬜ | — | — |
-| 16 | Eliminate redundant matmul in STE forward | triton-kernels | ⬜ | — | — |
-| 17 | Buffer pooling for P_aos + W_ste | triton-kernels | ⬜ | — | — |
-| 18 | Chunked reduction for elementwise backward | triton-kernels | ⬜ | — | — |
+| 15 | Batched compute_P_W (Triton, 25→1) | triton-kernels | 🔄 | agent/triton-kernels | — |
+| 16 | Eliminate redundant matmul in STE forward | triton-kernels | ✅ | agent/triton-kernels | 44530fc |
+| 17 | Buffer pooling for P_aos + W_ste | triton-kernels | ✅ | agent/triton-kernels | 56ca124 |
+| 18 | Chunked reduction for elementwise backward | triton-kernels | 🔄 | agent/triton-kernels | — |
 | 19 | Fused LoRA backward | lora-fusion | ⬜ | — | — |
 | 20 | Fused LoRA + PalettizedLinear backward | lora-fusion | ⬜ | — | — |
 | 21 | CUDA Graph capture for full step | cuda-graphs | ⬜ | — | — |
 | 22 | Stream double-buffer + CUDA Graphs integration | cuda-graphs | ⬜ | — | — |
-| 23 | Loss config switch (1-cos+norm_mse, 80/20) | quality-recipe | ⬜ | — | — |
-| 24 | Per-group gradient clipping | quality-recipe | ⬜ | — | — |
+| 23 | Loss config switch (1-cos+norm_mse, 80/20) | quality-recipe | ✅ | agent/quality-recipe | d00e7f6 |
+| 24 | Per-group gradient clipping | quality-recipe | ✅ | agent/quality-recipe | b5828a4 |
 | 25 | LUT-Q re-quantization (step 2000, 4000) | quality-recipe | ⬜ | — | — |
-| 26 | Deterministic-ST (remove Gumbel noise) | quality-recipe | ⬜ | — | — |
+| 26 | Deterministic-ST (remove Gumbel noise) | quality-recipe | 🔄 | agent/quality-recipe | 55e816a |
 
 ---
 
@@ -59,6 +59,7 @@
 | Timestamp | Agent | Event |
 |-----------|-------|-------|
 | 2026-08-23T00:00:00Z | orchestrator | Created Round 3 multi-agent infrastructure for full Triton fusion. 6 agents, 17 patches (P10-P26), 4 waves. Previous Round 1/2 patches (P1-P9) already merged to main. Current state: tps=0.6, backward=682ms (73% autograd overhead). Target: tps>3, backward<100ms. All work OFFLINE (no server). |
+| 2026-08-23T13:00:29Z | triton-kernels | Wave 1 complete: Patch 16 (commit 44530fc — eliminated redundant W_soft store in compute_P_W_ste_kernel) + Patch 17 (commit 56ca124 — buffer pooling for P_aos + W_ste + grad_W via module-level _P_POOL / _BWD_POOL dicts). Inbox messages sent to layer-fusion + lora-fusion with the new API contract (compute_P_W_ste_triton now returns 2-tuple, not 3-tuple). Syntax + import checks pass. Beginning Wave 2 (Patches 15, 18). |
 
 ---
 
@@ -67,8 +68,8 @@
 | Agent | Last Message | From | Subject | Action Required |
 |-------|--------------|------|---------|-----------------|
 | nn-module-foundation | — | — | — | — |
-| triton-kernels | — | — | — | — |
-| layer-fusion | — | — | — | — |
-| lora-fusion | — | — | — | — |
+| triton-kernels | 2026-08-23T00:00:00Z | orchestrator | Round 3 infra ready | Wave 1 done, Wave 2 started |
+| layer-fusion | 2026-08-23T13:00:29Z | triton-kernels | Wave 1 done — API stable | Rebase before Wave 2; use 2-tuple return |
+| lora-fusion | 2026-08-23T13:00:29Z | triton-kernels | Wave 1 done — backward API stable | Rebase before Wave 3; design Patch 20 to compute grad_W internally |
 | cuda-graphs | — | — | — | — |
 | quality-recipe | — | — | — | — |
