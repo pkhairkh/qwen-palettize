@@ -10,7 +10,7 @@
 |-------|--------|--------|--------|--------|--------|
 | nn-module-foundation | `agent/nn-module-foundation` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | training-recipe | `agent/training-recipe` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| kernels | `agent/kernels` | ✅ Done | ✅ Done | 🔄 In Progress | ⬜ |
+| kernels | `agent/kernels` | ✅ Done | ✅ Done | ✅ Done | ⬜ |
 | optimizer-streams | `agent/optimizer-streams` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 
 **Legend:** ⬜ Pending | 🔄 In Progress | ✅ Done | ❌ Blocked
@@ -21,7 +21,7 @@
 
 1. ⬜ nn-module-foundation (foundation — must merge first)
 2. ⬜ training-recipe (rebases on nn-module)
-3. ⬜ kernels (independent — can merge anytime after Wave 1)
+3. ⬜ kernels (independent — can merge anytime after Wave 1) — **READY**
 4. ⬜ optimizer-streams (rebases on nn-module + training-recipe)
 
 ---
@@ -49,6 +49,7 @@
 | 2025-08-22T12:00:00Z | orchestrator | Created agent-ctx infrastructure + 4 branches |
 | 2026-08-22T11:39:00Z | kernels | Wave 1 complete: Patch 5 (a–d) — AoS P layout + fused bwd kernel re-enabled |
 | 2026-08-22T11:55:00Z | kernels | Wave 2 complete: Patch 7 (a–c) — batched compute_P_W kernel (25 launches → 1) |
+| 2026-08-22T12:15:00Z | kernels | Wave 3 complete: Patch 8a profile test + 8b merge prep verified clean. Branch ready for merge. |
 
 ---
 
