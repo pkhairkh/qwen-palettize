@@ -1,12 +1,13 @@
 """Triton fused kernels for PalettizedLinear soft (Gumbel-Softmax + STE) BACKWARD.
 
-WAVE 2 — fused_soft_backward:
-  - `fused_soft_bwd_grad_x_kernel`:   grad_x = grad_y @ W_ste.T (Triton TC matmul)
-  - `fused_soft_bwd_grad_W_kernel`:   grad_W = x.T @ grad_y      (Triton TC matmul)
-  - `fused_soft_bwd_elementwise_kernel`: per-(j, o) kernel that loads P_aos,
-    reconstructs W_soft on-the-fly, and computes:
-      grad_logits[k, j, o] = grad_W[j, o] * P[k, j, o] * (palette[g, k] - W_soft[j, o])
-      grad_palette[g, k] += grad_W[j, o] * P[k, j, o]   (atomic_add, fp32)
+WAVE 2 (REVISED) — fused_soft_backward, performance-fixed:
+  - `fused_soft_bwd_grad_x_kernel`:   grad_x = grad_y @ W_ste.T (Triton TC matmul,
+                                       no tl.trans — loads W_ste transposed directly)
+  - `fused_soft_bwd_grad_W_kernel`:   grad_W = x.T @ grad_y      (Triton TC matmul, fp32)
+  - `fused_soft_bwd_elementwise_kernel`: per-(j, o) tile kernel with LARGE block sizes
+    (BM=128, BN=128 → 16K positions per program) and per-block grad_palette
+    accumulation to reduce atomic contention. Replaces the 3.7 GB/s disaster
+    with a proper memory-bound kernel targeting 200+ GB/s.
 
 Math (matches existing CUDA `fused_lut_linear_soft_bwd_fused_aos_kernel`):
   STE forward: y = x @ W_ste where W_ste = W_hard - W_soft.detach() + W_soft
@@ -15,28 +16,16 @@ Math (matches existing CUDA `fused_lut_linear_soft_bwd_fused_aos_kernel`):
     grad_x      = grad_y @ W_ste.T          (= grad_y @ W_hard.T numerically)
     grad_W_soft = x.T @ grad_y               (= grad_W_ste under STE)
     grad_logits[k,j,o] = grad_W_soft[j,o] * P[k,j,o] * (palette[g,k] - W_soft[j,o])
-      derivation: d(W_soft[j,o])/d(logits[k,j,o]) = P[k,j,o] * (palette[g,k] - W_soft[j,o])
-                  (softmax derivative → diagonal P[k]*(1-P[k]) minus off-diagonal P[k']*P[k],
-                   which simplifies to P[k] * (palette[g,k] - Σ P[k']*palette[g,k']))
     grad_palette[g,k] = Σ_{j,o in group g} grad_W_soft[j,o] * P[k,j,o]   (atomicAdd)
 
-Three kernels split by parallelism pattern (matmul TC vs. elementwise). The
-existing CUDA bwd kernel fuses (b) + (c) using shared-memory tiling, but the
-CUDA implementation's SOFT_BWD_BM_CHUNK=128 / BK=16 / BN=16 leaves the matmul
-under-tuned. Splitting into 3 Triton kernels lets `tl.dot` autotune to the
-optimal TC config (BM=128/256, BN=128/256, BK=32/64) for the matmuls while the
-elementwise kernel handles the per-(j, o) work.
-
-Layouts (must match Wave 1 forward + existing CUDA path):
-  grad_y:    (M, N) bf16  — input
-  x:         (M, K) bf16  — saved in forward ctx
-  W_ste:     (K, N) bf16  — saved in forward ctx (= W_hard numerically)
-  P_aos:     (K, N, 4) fp16 — saved in forward ctx
-  palette:   (G, 4) bf16  — saved in forward ctx
-  Outputs:
-    grad_x:      (M, K) bf16
-    grad_logits: (4, K, N) fp16 — SoA (plane stride = K*N), matches optimizer
-    grad_palette:(G, 4) fp32     — atomic accumulation
+PERFORMANCE FIXES (vs Wave 2 v1):
+  1. elementwise: BM=32,BN=32 → BM=128,BN=128 (16x more work per program).
+     Original was launch-overhead-bound (3.7 GB/s = 0.4% of HBM3e peak).
+     Also: accumulate grad_palette in registers per-block, do ONE atomic_add
+     per (block, k) at the end → reduces atomics from K*N to ~K*N/16K.
+  2. grad_x: removed tl.trans() (which forces a shared-memory transpose).
+     Instead, load W_ste with swapped stride order so the tile is already (BN, BK).
+  3. grad_W: kept as-is (already 3-4x faster than torch).
 """
 from __future__ import annotations
 import torch
@@ -47,9 +36,17 @@ import triton.language as tl
 # ═════════════════════════════════════════════════════════════════════════════
 # KERNEL 2a — grad_x = grad_y @ W_ste.T  (Triton TC matmul, transposed W)
 # ═════════════════════════════════════════════════════════════════════════════
-# W_ste is (K, N) contiguous → W_ste.T is (N, K) with stride (1, N).
-# grad_y is (M, N) contiguous.
-# grad_x[m, k] = Σ_n grad_y[m, n] * W_ste[k, n]   (we load W_ste row k = col k of W_ste.T)
+# PERFORMANCE FIX: removed tl.trans() — instead load W_ste tiles with the
+# stride order swapped so the tile is already (BN, BK) for tl.dot.
+#
+# W_ste is (K, N) row-major → W_ste[k, n] at offset k*stride_wk + n*stride_wn
+# We want grad_x[m, k] = Σ_n grad_y[m, n] * W_ste[k, n]
+#                       = Σ_n grad_y[m, n] * W_ste.T[n, k]
+# Tile (BM, BK) of output grad_x. Reduction dim is N (chunked by BN).
+#   grad_y tile: (BM, BN) at (m_chunk, n_offset)         — row-major
+#   W_ste tile:  (BN, BK) at (k_chunk, n_offset)         — load with swapped strides
+#     ptr = W_ste_ptr + n_offs[:, None]*stride_wn + k_offs[None, :]*stride_wk
+#   acc += tl.dot(grad_y_tile, W_ste_tile)   (BM, BN) @ (BN, BK) → (BM, BK)
 @triton.autotune(
     configs=[
         triton.Config({"BM": 64, "BN": 64, "BK": 32}, num_warps=4, num_stages=3),
@@ -60,6 +57,9 @@ import triton.language as tl
         triton.Config({"BM": 128, "BN": 256, "BK": 32}, num_warps=8, num_stages=3),
         triton.Config({"BM": 256, "BN": 128, "BK": 32}, num_warps=8, num_stages=3),
         triton.Config({"BM": 256, "BN": 256, "BK": 64}, num_warps=8, num_stages=3),
+        # New: larger BN to better amortize the inner loop
+        triton.Config({"BM": 128, "BN": 256, "BK": 64}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 256, "BN": 128, "BK": 64}, num_warps=8, num_stages=4),
     ],
     key=["M", "N", "K"],
 )
@@ -73,41 +73,32 @@ def fused_soft_bwd_grad_x_kernel(
     stride_gxm, stride_gxk,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
 ):
-    """grad_x[m, k] = Σ_n grad_y[m, n] * W_ste[k, n]"""
+    """grad_x[m, k] = Σ_n grad_y[m, n] * W_ste[k, n]  → output (M, K) bf16."""
     pid = tl.program_id(0)
     grid_m = tl.cdiv(M, BM)
-    grid_n = tl.cdiv(N, BN)
-    # L2-friendly swizzle: pid_m, pid_k for grad_x output (M, K)
-    # Inner reduction dim is N — load grad_y tile (BM, BN) and W_ste tile (BN, BK)
-    # But W_ste is (K, N) → we want W_ste[k_chunk, n_chunk] transposed access.
-    # Layout: W_ste[k, n] at offset k*stride_wk + n*stride_wn
-    # For grad_x[m, k] = Σ_n grad_y[m, n] * W_ste[k, n],
-    # we tile (m, k) and reduce over n in chunks of BN.
-    pid_m = pid // tl.cdiv(K, BK)
-    pid_k = pid % tl.cdiv(K, BK)
+    grid_k = tl.cdiv(K, BK)
+    pid_m = pid // grid_k
+    pid_k = pid % grid_k
 
-    offs_m = pid_m * BM + tl.arange(0, BM)  # M direction
-    offs_k = pid_k * BK + tl.arange(0, BK)  # K direction
-    offs_n = tl.arange(0, BN)               # N direction (reduction)
+    offs_m = pid_m * BM + tl.arange(0, BM)  # M direction (output row)
+    offs_k = pid_k * BK + tl.arange(0, BK)  # K direction (output col)
+    offs_n = tl.arange(0, BN)                # N direction (reduction)
 
-    # grad_y tile (BM, BN) at (m_chunk, n_offset)
+    # grad_y tile (BM, BN) at (m_chunk, n_offset) — standard row-major load
     gy_ptrs = grad_y_ptr + offs_m[:, None] * stride_gym + offs_n[None, :] * stride_gyn
-    # W_ste tile (BK, BN) at (k_chunk, n_offset) — transposed access (load row k, n)
-    w_ptrs = W_ste_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+    # W_ste tile (BN, BK) at (k_chunk, n_offset) — load TRANSPOSED by swapping strides
+    # W_ste[k, n] at k*stride_wk + n*stride_wn → load as (BN, BK) with n in rows, k in cols
+    w_ptrs = W_ste_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
 
     acc = tl.zeros((BM, BK), dtype=tl.float32)
     for n_iter in range(0, tl.cdiv(N, BN)):
-        mask_gy = (offs_m[:, None] < M) & (offs_n[None, :] + n_iter * BN < N)
-        mask_w = (offs_k[:, None] < K) & (offs_n[None, :] + n_iter * BN < N)
-        gy_tile = tl.load(gy_ptrs, mask=mask_gy, other=0.0)
-        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)
-        # grad_x[m, k] += Σ_n gy[m, n] * w[k, n]
-        # = tl.dot(gy_tile (BM, BN), w_tile.T (BN, BK))
-        # tl.dot(A, B) does A @ B. We want gy @ w.T → use w_tile of shape (BN, BK)
-        # by transposing: actually we have w_tile (BK, BN), so transpose to (BN, BK).
-        # Triton's tl.dot supports transposing via tl.trans(w_tile).
-        w_tile_t = tl.trans(w_tile)  # (BN, BK)
-        acc += tl.dot(gy_tile, w_tile_t)
+        n_off = n_iter * BN
+        mask_gy = (offs_m[:, None] < M) & ((offs_n[None, :] + n_off) < N)
+        mask_w = ((offs_n[:, None] + n_off) < N) & (offs_k[None, :] < K)
+        gy_tile = tl.load(gy_ptrs, mask=mask_gy, other=0.0)  # (BM, BN) bf16
+        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)     # (BN, BK) bf16
+        # tl.dot((BM,BN), (BN,BK)) → (BM, BK) — no tl.trans needed!
+        acc += tl.dot(gy_tile, w_tile)
 
         gy_ptrs += BN * stride_gyn
         w_ptrs += BN * stride_wn
@@ -118,10 +109,19 @@ def fused_soft_bwd_grad_x_kernel(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# KERNEL 2b — grad_W = x.T @ grad_y  (Triton TC matmul)
+# KERNEL 2b — grad_W = x.T @ grad_y  (Triton TC matmul, fp32 output)
 # ═════════════════════════════════════════════════════════════════════════════
-# x is (M, K) bf16, grad_y is (M, N) bf16 → grad_W (K, N) bf16
+# x is (M, K) bf16, grad_y is (M, N) bf16 → grad_W (K, N) fp32
 # grad_W[k, n] = Σ_m x[m, k] * grad_y[m, n]
+# Tile (BM, BN) of output grad_W (BM = K-block, BN = N-block). Reduction dim M.
+#   x_tile:      (BK, BM) at (m_offset, k_chunk) — load with swapped strides
+#   grad_y_tile: (BK, BN) at (m_offset, n_chunk) — standard row-major load
+#   acc += tl.dot(x_tile.T, grad_y_tile)  →  (BM, BN)
+# PERFORMANCE: kept the tl.trans() here because x_tile is (BK, BM) and we need
+# (BM, BK) for tl.dot. The alternative (loading x with swapped strides) would
+# give (BM, BK) directly but x is row-major (M, K) so loading (BM, BK) at
+# (k_chunk, m_offset) requires strided access. tl.trans is fine here because
+# BK=32 fits in shared memory efficiently.
 @triton.autotune(
     configs=[
         triton.Config({"BM": 64, "BN": 64, "BK": 32}, num_warps=4, num_stages=3),
@@ -132,6 +132,8 @@ def fused_soft_bwd_grad_x_kernel(
         triton.Config({"BM": 128, "BN": 256, "BK": 32}, num_warps=8, num_stages=3),
         triton.Config({"BM": 256, "BN": 128, "BK": 32}, num_warps=8, num_stages=3),
         triton.Config({"BM": 256, "BN": 256, "BK": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BM": 128, "BN": 256, "BK": 64}, num_warps=8, num_stages=4),
+        triton.Config({"BM": 256, "BN": 128, "BK": 64}, num_warps=8, num_stages=4),
     ],
     key=["M", "N", "K"],
 )
@@ -145,34 +147,30 @@ def fused_soft_bwd_grad_W_kernel(
     stride_wk, stride_wn,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
 ):
-    """grad_W[k, n] = Σ_m x[m, k] * grad_y[m, n]  → output (K, N) bf16."""
+    """grad_W[k, n] = Σ_m x[m, k] * grad_y[m, n]  → output (K, N) fp32."""
     pid = tl.program_id(0)
-    grid_k = tl.cdiv(K, BM)  # output K direction
+    grid_k = tl.cdiv(K, BM)
     grid_n = tl.cdiv(N, BN)
     pid_k = pid // grid_n
     pid_n = pid % grid_n
 
     offs_k = pid_k * BM + tl.arange(0, BM)  # K direction (output row)
     offs_n = pid_n * BN + tl.arange(0, BN)  # N direction (output col)
-    offs_m = tl.arange(0, BK)               # M direction (reduction)
+    offs_m = tl.arange(0, BK)                # M direction (reduction)
 
-    # x tile (BK, BM) at (m_offset, k_chunk) — x[m, k]
-    # We want x.T tile shape (BK, BM) so we can dot with grad_y (BK, BN)
-    # x is (M, K) so x[m, k] at offset m*stride_xm + k*stride_xk
-    # We load x as (BK, BM) by transposing: load (BM, BK) then tl.trans
+    # x tile (BK, BM) at (m_offset, k_chunk) — x[m, k] at m*stride_xm + k*stride_xk
     x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
     # grad_y tile (BK, BN) at (m_offset, n_chunk) — grad_y[m, n]
     gy_ptrs = grad_y_ptr + offs_m[:, None] * stride_gym + offs_n[None, :] * stride_gyn
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for m_iter in range(0, tl.cdiv(M, BK)):
-        mask_x = (offs_m[:, None] + m_iter * BK < M) & (offs_k[None, :] < K)
-        mask_gy = (offs_m[:, None] + m_iter * BK < M) & (offs_n[None, :] < N)
-        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)  # (BK, BM)
-        gy_tile = tl.load(gy_ptrs, mask=mask_gy, other=0.0)  # (BK, BN)
-        # grad_W[k, n] += Σ_m x[m, k] * grad_y[m, n]
-        # = tl.dot(x_tile.T (BM, BK), gy_tile (BK, BN))
-        # = tl.dot(tl.trans(x_tile), gy_tile)
+        m_off = m_iter * BK
+        mask_x = ((offs_m[:, None] + m_off) < M) & (offs_k[None, :] < K)
+        mask_gy = ((offs_m[:, None] + m_off) < M) & (offs_n[None, :] < N)
+        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)  # (BK, BM) bf16
+        gy_tile = tl.load(gy_ptrs, mask=mask_gy, other=0.0)  # (BK, BN) bf16
+        # tl.dot((BM,BK), (BK,BN)) → (BM, BN) — need x_tile.T
         x_tile_t = tl.trans(x_tile)  # (BM, BK)
         acc += tl.dot(x_tile_t, gy_tile)
 
@@ -181,30 +179,31 @@ def fused_soft_bwd_grad_W_kernel(
 
     gW_ptrs = grad_W_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
     mask_gW = (offs_k[:, None] < K) & (offs_n[None, :] < N)
-    # Store grad_W in fp32 (used as input to elementwise kernel which expects fp32)
     tl.store(gW_ptrs, acc, mask=mask_gW)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# KERNEL 2c — elementwise bwd: grad_logits + atomic grad_palette
+# KERNEL 2c — elementwise bwd: grad_logits + atomic grad_palette (REVISED)
 # ═════════════════════════════════════════════════════════════════════════════
-# For each (j, o): load P_aos[j, o, 0..3] (4 fp16, AoS coalesced) + palette[g, 0..3]
-# Reconstruct W_soft = Σ P[k] * palette[g, k]  (fp32)
-# Compute grad_logits[k, j, o] = grad_W[j, o] * P[k, j, o] * (palette[g, k] - W_soft)
-# Atomic-add grad_palette[g, k] += grad_W[j, o] * P[k, j, o]   (fp32)
+# PERFORMANCE FIXES:
+#  1. Block size 32×32 → 128×128 (16x more work per program).
+#     Original achieved only 3.7 GB/s (0.4% of HBM3e peak) due to launch overhead.
+#  2. Per-block grad_palette accumulation: each block computes its local
+#     contribution to grad_palette in registers, then does ONE atomic_add per
+#     (group, k) at the end. Reduces atomic ops from K*N to ~K*N/16384.
+#  3. Mask is precomputed once, reused for all loads/stores.
 #
-# NOTE: We use a FIXED config (no @triton.autotune) because Triton's autotuner
-# runs the kernel multiple times during benchmarking, and atomic_add side
-# effects accumulate across runs. The autotuner's `pre_hook` option could
-# reset grad_palette to zero between runs, but on Triton 3.5 the pre_hook
-# signature is brittle and varies across versions. A fixed config sidesteps
-# the issue cleanly. The elementwise kernel is also not the hot path (the
-# matmul kernels 2a/2b dominate), so autotune wouldn't help much anyway.
+# Memory traffic per position:
+#   Read:  grad_W (4B) + P_aos (8B fp16×4) + palette (8B bf16×4) = 20 B
+#   Write: grad_logits (8B fp16×4) + grad_palette (16B fp32×4 atomic) = 24 B
+#   Total: 44 B/pos
+# For K=9216, N=2560 (23.6M positions): ~1 GB total → at 500 GB/s = 2 ms.
+# Target: < 3 ms for the largest shape (was 137 ms).
 @triton.jit
 def fused_soft_bwd_elementwise_kernel(
-    grad_W_ptr,    # (K, N) fp32 — from Kernel 2b
-    P_aos_ptr,     # (K, N, 4) fp16 AoS — from forward ctx
-    palette_ptr,   # (G, 4) bf16
+    grad_W_ptr,       # (K, N) fp32 — from Kernel 2b
+    P_aos_ptr,        # (K, N, 4) fp16 AoS — from forward ctx
+    palette_ptr,      # (G, 4) bf16
     grad_logits_ptr,  # (4, K, N) fp16 — OUTPUT SoA (plane stride = K*N)
     grad_palette_ptr, # (G, 4) fp32 — OUTPUT (atomic)
     K, N, G,
@@ -221,35 +220,34 @@ def fused_soft_bwd_elementwise_kernel(
     mask_n = offs_n < N
     mask = mask_m[:, None] & mask_n[None, :]
 
-    j_grid = offs_m[:, None]
-    o_grid = offs_n[None, :]
+    j_grid = offs_m[:, None]   # (BM, 1)
+    o_grid = offs_n[None, :]    # (1, BN)
     idx_grid = j_grid * N + o_grid  # (BM, BN) — flat (K, N) index
-    g_grid = o_grid // group_size   # (1, BN)
+    g_grid = o_grid // group_size    # (1, BN)
 
     plane_size = K * N
 
     # ── Load grad_W[j, o] (fp32) ───────────────────────────────────────────
     grad_W_val = tl.load(grad_W_ptr + idx_grid, mask=mask, other=0.0)  # (BM, BN) f32
 
-    # ── Load P_aos[j, o, 0..3] (4 fp16, AoS — coalesced) ──────────────────
+    # ── Load P_aos[j, o, 0..3] (4 fp16, AoS — coalesced 64-bit load) ────────
     paos_base = idx_grid * 4  # (BM, BN)
     p0 = tl.load(P_aos_ptr + paos_base + 0, mask=mask, other=0.0).to(tl.float32)
     p1 = tl.load(P_aos_ptr + paos_base + 1, mask=mask, other=0.0).to(tl.float32)
     p2 = tl.load(P_aos_ptr + paos_base + 2, mask=mask, other=0.0).to(tl.float32)
     p3 = tl.load(P_aos_ptr + paos_base + 3, mask=mask, other=0.0).to(tl.float32)
 
-    # ── Load palette[g, 0..3] (4 bf16) ─────────────────────────────────────
+    # ── Load palette[g, 0..3] (4 bf16) — broadcast across BM rows ────────────
     pal_base = g_grid * 4  # (1, BN)
     c0 = tl.load(palette_ptr + pal_base + 0, mask=mask_n[None, :], other=0.0).to(tl.float32)
     c1 = tl.load(palette_ptr + pal_base + 1, mask=mask_n[None, :], other=0.0).to(tl.float32)
     c2 = tl.load(palette_ptr + pal_base + 2, mask=mask_n[None, :], other=0.0).to(tl.float32)
     c3 = tl.load(palette_ptr + pal_base + 3, mask=mask_n[None, :], other=0.0).to(tl.float32)
 
-    # ── Reconstruct W_soft = Σ P[k] * palette[g, k] ───────────────────────
-    W_soft = p0 * c0 + p1 * c1 + p2 * c2 + p3 * c3
+    # ── Reconstruct W_soft = Σ P[k] * palette[g, k] ──────────────────────────
+    W_soft = p0 * c0 + p1 * c1 + p2 * c2 + p3 * c3  # (BM, BN) f32
 
     # ── grad_logits[k, j, o] = grad_W * P[k] * (palette[g, k] - W_soft) ─────
-    # Output layout: (4, K, N) SoA — plane k at offset k*plane_size + j*N + o
     gl_base = idx_grid  # offset within a plane
     gl0 = (grad_W_val * p0 * (c0 - W_soft)).to(tl.float16)
     gl1 = (grad_W_val * p1 * (c1 - W_soft)).to(tl.float16)
@@ -260,20 +258,47 @@ def fused_soft_bwd_elementwise_kernel(
     tl.store(grad_logits_ptr + 2 * plane_size + gl_base, gl2, mask=mask)
     tl.store(grad_logits_ptr + 3 * plane_size + gl_base, gl3, mask=mask)
 
-    # ── grad_palette[g, k] += grad_W * P[k]  (atomic_add, fp32) ─────────────
-    # pal_base is (1, BN) — same shape as g_grid; each (j, o) maps to one g.
-    # We need to atomic_add at offset pal_base[o] + k for k = 0..3.
-    # Since pal_base is per-column, broadcast over rows: pal_base[:, None] doesn't
-    # work directly because we want different o → different g. Use the column
-    # index directly.
-    pal_off = g_grid * 4  # (1, BN) — group offset for each column
-    # Broadcast pal_off to (BM, BN) by replicating across rows:
-    # tl.atomic_add expects pointer + offset tensors of matching shape.
-    pal_off_b = pal_off + tl.zeros_like(j_grid)  # (BM, BN) broadcast
-    tl.atomic_add(grad_palette_ptr + pal_off_b + 0, (grad_W_val * p0), mask=mask)
-    tl.atomic_add(grad_palette_ptr + pal_off_b + 1, (grad_W_val * p1), mask=mask)
-    tl.atomic_add(grad_palette_ptr + pal_off_b + 2, (grad_W_val * p2), mask=mask)
-    tl.atomic_add(grad_palette_ptr + pal_off_b + 3, (grad_W_val * p3), mask=mask)
+    # ── grad_palette[g, k] += grad_W * P[k]  (atomic_add, fp32) ──────────────
+    # REDUCED CONTENTION: each block has BN columns spanning BN/group_size groups.
+    # For each group g in this block's column range, we sum the contributions
+    # from all (BM, BN/group_size) positions in registers, then do ONE atomic_add
+    # per (g, k). This reduces atomics from BM*BN to 4 * (BN/group_size) per block.
+    #
+    # For BM=128, BN=128, GS=256: BN/GS = 0.5 → at most 1 group per block (since
+    # BN=128 < GS=256, each block's columns are within a single group). So we do
+    # 4 atomic_adds per block. Original did BM*BN = 16384 atomics per block.
+    #
+    # Implementation: build a per-block contribution array of shape (NUM_GROUPS_IN_BLOCK, 4),
+    # then atomic_add each. Use tl.sum over the (BM, BN_per_group) sub-tile.
+    #
+    # Simplification: since BN <= group_size in our configs (BN=128, GS=256),
+    # each block touches exactly ONE group (the group of column pid_n*BN).
+    # If BN > group_size, we'd need a loop — but we keep BN <= group_size.
+    #
+    # The block's group index is g_block = (pid_n * BN) // group_size.
+    # All columns in this block map to the same group (when BN <= group_size).
+
+    # Compute per-block contribution to grad_palette[g_block, k] for k=0..3.
+    # contribution_k = Σ_{j in block, o in block} grad_W[j, o] * P[k, j, o]
+    # = tl.sum(grad_W_val * p_k, axis=(0, 1))  — sum over both BM and BN
+    gp_off = pid_n * BN // group_size  # scalar group index for this block
+    # Guard: only do the atomic if this block's columns are in-bounds AND
+    # all map to the same group (which they do when BN <= group_size).
+    # For positions where mask is False (OOB), grad_W_val * p_k is 0 (because
+    # p_k was loaded with other=0.0... but grad_W_val may be garbage at OOB).
+    # Fix: zero out grad_W_val where mask is False before summing.
+    grad_W_masked = tl.where(mask, grad_W_val, 0.0)
+    contrib0 = tl.sum(grad_W_masked * p0, axis=None)  # scalar
+    contrib1 = tl.sum(grad_W_masked * p1, axis=None)
+    contrib2 = tl.sum(grad_W_masked * p2, axis=None)
+    contrib3 = tl.sum(grad_W_masked * p3, axis=None)
+
+    # Only atomic_add if the block's first column is in-bounds (any column is valid)
+    if pid_n * BN < N:
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 0, contrib0)
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 1, contrib1)
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 2, contrib2)
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 3, contrib3)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -281,7 +306,7 @@ def fused_soft_bwd_elementwise_kernel(
 # ═════════════════════════════════════════════════════════════════════════════
 def fused_soft_bwd_grad_x_triton(
     grad_y: torch.Tensor,    # (M, N) bf16
-    W_ste: torch.Tensor,     # (K, N) bf16
+    W_ste: torch.Tensor,      # (K, N) bf16
 ) -> torch.Tensor:
     """grad_x = grad_y @ W_ste.T  → (M, K) bf16."""
     assert grad_y.dtype == torch.bfloat16
@@ -345,9 +370,12 @@ def fused_soft_bwd_elementwise_triton(
     palette = palette.contiguous()
     grad_logits = torch.empty((4, K, N), dtype=torch.float16, device=P_aos.device)
     grad_palette = torch.zeros((G, 4), dtype=torch.float32, device=palette.device)
-    # Fixed config (BM=32, BN=32, 8 warps) — see kernel note on autotune
-    # side-effect issue with atomic_add.
-    BM, BN = 32, 32
+    # LARGE block sizes — original 32×32 was launch-overhead-bound (3.7 GB/s = 0.4% peak).
+    # 128×128 → 16x more work per program, 16x fewer programs.
+    # Constraint: BN <= group_size (256) so each block touches exactly ONE group
+    # (enables the per-block register accumulation → minimal atomics).
+    # For GS=256, BN=128 is safe (2 blocks per group, each does 4 atomic_adds).
+    BM, BN = 128, 128
     grid = (triton.cdiv(K, BM), triton.cdiv(N, BN))
     fused_soft_bwd_elementwise_kernel[grid](
         grad_W, P_aos, palette,
