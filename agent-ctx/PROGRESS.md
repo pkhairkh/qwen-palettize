@@ -10,7 +10,7 @@
 |-------|--------|--------|--------|--------|--------|--------|
 | nn-module-foundation | `agent/nn-module-foundation` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | triton-kernels | `agent/triton-kernels` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
-| layer-fusion | `agent/layer-fusion` | ⬜ N/A | 🔄 In Progress (P10 ✅, P12 ✅) | ⬜ Pending | ⬜ Pending | ⬜ |
+| layer-fusion | `agent/layer-fusion` | ⬜ N/A | ✅ Done | ✅ Done | ⬜ Pending | ⬜ |
 | lora-fusion | `agent/lora-fusion` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | cuda-graphs | `agent/cuda-graphs` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
 | quality-recipe | `agent/quality-recipe` | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ Pending | ⬜ |
@@ -37,8 +37,8 @@
 | 10 | Fused RMSNorm + Linear | layer-fusion | ✅ | agent/layer-fusion | 8054af7 |
 | 11 | nn.Module forward signature | nn-module-foundation | ⬜ | — | — |
 | 12 | Fused MLP (gate+up+SiLU+down) | layer-fusion | ✅ | agent/layer-fusion | f25bc91 |
-| 13 | Fused Attention (FlashAttention-style) | layer-fusion | ⬜ | — | — |
-| 14 | Fused GatedDeltaNet (conv1d + delta-rule) | layer-fusion | ⬜ | — | — |
+| 13 | Fused Attention (FlashAttention-style) | layer-fusion | ✅ | agent/layer-fusion | 9e31186 |
+| 14 | Fused GatedDeltaNet (conv1d + delta-rule) | layer-fusion | ✅ | agent/layer-fusion | 291b26b |
 | 15 | Batched compute_P_W (Triton, 25→1) | triton-kernels | ⬜ | — | — |
 | 16 | Eliminate redundant matmul in STE forward | triton-kernels | ⬜ | — | — |
 | 17 | Buffer pooling for P_aos + W_ste | triton-kernels | ⬜ | — | — |
@@ -61,6 +61,8 @@
 | 2026-08-23T00:00:00Z | orchestrator | Created Round 3 multi-agent infrastructure for full Triton fusion. 6 agents, 17 patches (P10-P26), 4 waves. Previous Round 1/2 patches (P1-P9) already merged to main. Current state: tps=0.6, backward=682ms (73% autograd overhead). Target: tps>3, backward<100ms. All work OFFLINE (no server). |
 | 2026-08-23T01:00:00Z | layer-fusion | Patch 10 (fused RMSNorm + PalettizedLinear) committed at 8054af7. Three Triton kernels: rmsnorm_forward, rmsnorm_backward, fused_rmsnorm_matmul (autotuned). FusedRMSNormLinear autograd Function — fuses RMSNorm into the matmul (eliminates x_normed HBM round-trip). Imports OK. |
 | 2026-08-23T01:30:00Z | layer-fusion | Patch 12 (fused SwiGLU MLP) committed at f25bc91. Three Triton kernels: fused_silu_mul, fused_silu_mul_backward, fused_dual_grad_x (autotuned). FusedMLP autograd Function — fuses gate*SiLU(up) elementwise + dual grad_x accumulation (eliminates 1 aten::add_ per MLP). Imports OK. Wave 2 closeout: 2/2 patches done. |
+| 2026-08-23T02:30:00Z | layer-fusion | Patch 13 (fused FlashAttention) committed at 9e31186. Two Triton kernels in scripts/triton_layer.py: flash_attention_kernel (forward, per-(token,head) causal FA2 with online softmax) and flash_attention_backward_kernel (recompute + grad, rotary inverse). FusedFlashAttention autograd Function. Imports OK. |
+| 2026-08-23T03:00:00Z | layer-fusion | Patch 14 (fused GatedDeltaNet) committed at 291b26b. Added to scripts/triton_layer.py: gated_delta_net_forward_kernel (per-head, sequential along seq — conv1d EMA + elu+1 + delta-rule state update + out read), gated_delta_net_forward_triton launcher, FusedGatedDeltaNet autograd Function (forward fused, backward BPTT via PyTorch recomputation). Imports OK. Wave 3 closeout: 2/2 patches done. ALL layer-fusion patches complete (P10, P12, P13, P14). Full DoD import check passes. |
 
 ---
 
@@ -70,7 +72,7 @@
 |-------|--------------|------|---------|-----------------|
 | nn-module-foundation | — | — | — | — |
 | triton-kernels | — | — | — | — |
-| layer-fusion | 2026-08-23T01:30:00Z | layer-fusion (self) | Wave 2 closeout (P10 + P12 done) | Wave 3 starts after Patch 15 API stable |
+| layer-fusion | 2026-08-23T03:00:00Z | layer-fusion (self) | Wave 3 closeout — ALL patches (P10, P12, P13, P14) done | Ready for merge to main (after nn-module + triton-kernels) |
 | lora-fusion | — | — | — | — |
-| cuda-graphs | 2026-08-23T01:30:00Z | layer-fusion | Wave 2 closeout — P10 + P12 ready for graph capture | Wait for Wave 3 (P13+P14) before full layer graph capture |
+| cuda-graphs | 2026-08-23T03:00:00Z | layer-fusion | Wave 3 closeout — all layer kernels ready (P10, P12, P13, P14) | Full CUDA Graph capture now possible (still need lora-fusion P19/P20 for full layer) |
 | quality-recipe | — | — | — | — |
