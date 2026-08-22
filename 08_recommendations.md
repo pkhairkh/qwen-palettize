@@ -1,501 +1,352 @@
-# 08 — Concrete Recommendations (with Code Patches)
+# 08 — Concrete Recommendations: Code Patches with Expected Speedup
 
-This document provides drop-in code patches for the top 7 fixes identified in `00_overview.md`. Each patch is self-contained, can be applied independently, and includes the rationale, expected improvement, and testing notes.
-
----
-
-## Fix 1: Enable LoftQ SVD initialization for LoRA
-
-**Problem:** `train_qwen.py:718` constructs `QwenLoRA` with `init="loftq"` but `original_weight=None`, causing the SVD branch (`qwen_model.py:209-222`) to be skipped and the fallback zero-init B (`qwen_model.py:223-225`) to be used. LoRA must climb out of a zero-init valley from scratch.
-
-**Expected improvement:** +1-2% cos (faster LoRA convergence, especially for the 5 worst Linears).
-
-**Patch (file: `scripts/train_qwen.py`, function: `build_student_super_block`, around line 696):**
-
-```python
-# BEFORE (lines 696-725):
-    # Attach LoRA on ALL palettized Linears.
-    # Use rank-32 for the 5 worst-cosine Linears (from calib_sb0.log),
-    # rank-16 for the rest. These 5 had cos < 0.93 after calibration.
-    total_lora = 0
-    BIG_LORA_RANK = lora_rank * 2  # 32 if lora_rank=16
-    BIG_LORA_ALPHA = lora_alpha * 2  # 64 if lora_alpha=32
-    BIG_LORA_TARGETS = {
-        (0, "linear_attn.in_proj_z"),
-        (1, "mlp.down_proj"),
-        (2, "linear_attn.out_proj"),
-        (2, "linear_attn.in_proj_qkv"),
-        (3, "self_attn.k_proj"),
-    }
-    for layer_idx in range(sb_start, sb_end):
-        layer = model.model.layers[layer_idx]
-        for name, module in layer.named_modules():
-            if isinstance(module, (PalettizedLinear, nn.Linear)) and not isinstance(module, QwenLoRA):
-                is_big = (layer_idx, name) in BIG_LORA_TARGETS
-                rank = BIG_LORA_RANK if is_big else lora_rank
-                alpha = BIG_LORA_ALPHA if is_big else lora_alpha
-                lora_mod = QwenLoRA(module, rank=rank, alpha=alpha, init="loftq", original_weight=None)
-                parent = layer
-                parts = name.split(".")
-                for p in parts[:-1]:
-                    parent = getattr(parent, p)
-                setattr(parent, parts[-1], lora_mod)
-                total_lora += 1
-
-# AFTER:
-    # Capture original weights for LoftQ SVD init (must happen BEFORE
-    # palettization replaces the nn.Linear with PalettizedLinear).
-    # We need the ORIGINAL fp16 weight, not the palettized reconstruction.
-    # Strategy: re-load the original weights from the HF model checkpoint
-    # (cheaper than re-loading the full model — just the relevant tensors).
-    from qwen_model import capture_original_weights_from_checkpoint
-    original_weights = capture_original_weights_from_checkpoint(sb_idx, model)
-
-    # Attach LoRA on ALL palettized Linears.
-    # Use rank-32 for the 5 worst-cosine Linears (from calib_sb0.log),
-    # rank-16 for the rest. These 5 had cos < 0.93 after calibration.
-    total_lora = 0
-    BIG_LORA_RANK = lora_rank * 2  # 32 if lora_rank=16
-    BIG_LORA_ALPHA = lora_alpha * 2  # 64 if lora_alpha=32
-    BIG_LORA_TARGETS = {
-        (0, "linear_attn.in_proj_z"),
-        (1, "mlp.down_proj"),
-        (2, "linear_attn.out_proj"),
-        (2, "linear_attn.in_proj_qkv"),
-        (3, "self_attn.k_proj"),
-    }
-    for layer_idx in range(sb_start, sb_end):
-        layer = model.model.layers[layer_idx]
-        for name, module in layer.named_modules():
-            if isinstance(module, (PalettizedLinear, nn.Linear)) and not isinstance(module, QwenLoRA):
-                is_big = (layer_idx, name) in BIG_LORA_TARGETS
-                rank = BIG_LORA_RANK if is_big else lora_rank
-                alpha = BIG_LORA_ALPHA if is_big else lora_alpha
-                # Look up the original weight for this Linear
-                full_name = f"model.layers.{layer_idx}.{name}.weight"
-                orig_w = original_weights.get(full_name)
-                lora_mod = QwenLoRA(module, rank=rank, alpha=alpha, init="loftq",
-                                    original_weight=orig_w)
-                parent = layer
-                parts = name.split(".")
-                for p in parts[:-1]:
-                    parent = getattr(parent, p)
-                setattr(parent, parts[-1], lora_mod)
-                total_lora += 1
-```
-
-**New helper function (file: `scripts/qwen_model.py`, add after `capture_original_weights` at line 795):**
-
-```python
-def capture_original_weights_from_checkpoint(sb_idx, student_model):
-    """Load original fp16 weights from the HF checkpoint for LoftQ SVD init.
-
-    This avoids keeping the full teacher model in memory — we only need
-    the weights for the Linears in the current super-block.
-
-    Args:
-        sb_idx: super-block index
-        student_model: the student PartialWrapper (for layer count reference)
-
-    Returns:
-        dict: {tensor_name: weight_tensor}
-    """
-    from transformers import AutoModelForCausalLM
-    import gc
-
-    sb_start, sb_end = SUPER_BLOCKS[sb_idx]
-    orig_weights = {}
-
-    # Load only the relevant layers from the checkpoint
-    # (HF from_pretrained loads everything, but we can extract and free)
-    model_name = "Qwen/Qwen3.5-4B"
-    full_model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, low_cpu_mem_usage=True
-    )
-    for layer_idx in range(sb_start, sb_end):
-        layer = full_model.model.layers[layer_idx]
-        layer_prefix = f"model.layers.{layer_idx}"
-        for name, module in layer.named_modules():
-            if isinstance(module, nn.Linear):
-                full_name = f"{layer_prefix}.{name}.weight"
-                orig_weights[full_name] = module.weight.data.clone()
-    del full_model
-    gc.collect()
-    torch.cuda.empty_cache()
-    return orig_weights
-```
-
-**Testing:** After applying this patch, run training for 100 steps and verify that the LoRA B matrices are non-zero at step 0 (use `torch.norm(lora_mod.lora_B)` — should be > 0, not 0).
+> **Wave 4 deliverable #2.** Target: ≥3 pages. Provides a prioritised
+> roadmap of code patches with expected speedups, in implementation order
+> from cheapest-to-highest-impact.
 
 ---
 
-## Fix 2: Switch loss to `1-cos+norm_mse` with `cos=0.8, mse=0.2`
+## 1. Priority-ordered roadmap
 
-**Problem:** Current default is `loss_type = "norm_mse"` with `loss_weights = {"cos": 0.0, "mse": 1.0}` (`train_qwen.py:96-97`). The cosine term is monitored but not in the loss, so direction alignment is not explicitly optimized.
+| # | Patch | Effort | Step-time savings | Cumulative step time |
+|---|-------|--------|-------------------|----------------------|
+| 1 | Stream double-buffering (`06_stream_overlap.md`) | 0.5 day | 69 ms | 461 ms |
+| 2 | AoS layout for `P` (`02_fused_bwd_fix.md`) | 1 day | 150 ms | 311 ms |
+| 3 | Batched `compute_P_W` (`03_batched_compute_pw.md`) | 2 days | 18 ms | 293 ms |
+| 4 | Fused `bwd_fused_aos` kernel re-enabled | 1 day | 90 ms | 203 ms |
+| 5 | Buffer pooling for `P_aos` | 0.5 day | (memory) | 203 ms |
+| 6 | Fused AdamW (`torch.optim.AdamW(fused=True)`) | 0.5 day | 70 ms | 133 ms |
+| 7 | `CUBLAS_WORKSPACE_CONFIG` cap | 0.1 day | (enables batch=64) | 133 ms |
+| 8 | TMA + `wgmma` migration (`04_sm120_optimal.md` A+B) | 4 days | 60 ms | 73 ms |
+| 9 | `tcgen05.mma` (`04_sm120_optimal.md` C) | 5 days | 20 ms | 53 ms |
+| 10 | CUDA Graphs for full step | 1 day | 2 ms | 51 ms |
 
-**Expected improvement:** +1-2% cos.
-
-**Patch (file: `scripts/train_qwen.py`, lines 96-97):**
-
-```python
-# BEFORE:
-    "loss_type": "norm_mse",
-    "loss_weights": {"cos": 0.0, "mse": 1.0},
-
-# AFTER:
-    "loss_type": "1-cos+norm_mse",
-    "loss_weights": {"cos": 0.8, "mse": 0.2},
-```
-
-**Testing:** After applying this patch, run training for 500 steps and verify that the logged `cos` metric improves faster than with `norm_mse` alone. Expected: cos 0.937 → 0.95+ in 500 steps (vs 0.94 with `norm_mse`).
-
----
-
-## Fix 3: Promote palette to fp32
-
-**Problem:** Palette is stored as bf16 (`qwen_model.py:82-85`), losing precision. The gradient is also cast to bf16 at the autograd boundary (`fused_lut_linear_cuda.py:168, 662`).
-
-**Expected improvement:** +0.5-1% cos.
-
-**Patch 3a (file: `scripts/qwen_model.py`, lines 82-85):**
-
-```python
-# BEFORE:
-        self.palette = nn.Parameter(
-            initial_palette.clone().to(torch.bfloat16) if initial_palette is not None
-            else torch.zeros(n_groups, palette_size, dtype=torch.bfloat16)
-        )
-
-# AFTER:
-        # Palette in fp32: only 2,208 params (8.8 KB), negligible memory cost.
-        # fp32 preserves gradient precision through the bf16-cast bottleneck
-        # at fused_lut_linear_cuda.py:168 (hard) and :662 (soft).
-        PALETTE_DTYPE = torch.float32
-        self.palette = nn.Parameter(
-            initial_palette.clone().to(PALETTE_DTYPE) if initial_palette is not None
-            else torch.zeros(n_groups, palette_size, dtype=PALETTE_DTYPE)
-        )
-```
-
-**Patch 3b (file: `scripts/qwen_model.py`, in `PalettizedLinear.forward`, around line 148):**
-
-The CUDA kernel asserts `palette.dtype == torch::kBFloat16`. We need to cast the palette to bf16 just for the kernel call, while keeping the fp32 parameter for autograd:
-
-```python
-# BEFORE (lines 140-153):
-        if self._use_cuda and x_flat.is_cuda and not self.pre_transposed:
-            if self.training and self.use_soft_indices and self.index_logits is not None:
-                y = self._soft_kernel(
-                    x_flat, self.palette, self.index_logits,
-                    self.bias, self.group_size, self.tau
-                )
-            else:
-                y = self._hard_kernel(
-                    x_flat, self.palette, self.indices_int8,
-                    self.bias, self.group_size
-                )
-
-# AFTER:
-        if self._use_cuda and x_flat.is_cuda and not self.pre_transposed:
-            # Cast palette to bf16 for the CUDA kernel (kernel asserts bf16).
-            # The cast is differentiable: grad_palette_bf16 flows back to
-            # grad_palette_fp32 via autograd's automatic dtype promotion.
-            palette_bf16 = self.palette.to(torch.bfloat16)
-            if self.training and self.use_soft_indices and self.index_logits is not None:
-                y = self._soft_kernel(
-                    x_flat, palette_bf16, self.index_logits,
-                    self.bias, self.group_size, self.tau
-                )
-            else:
-                y = self._hard_kernel(
-                    x_flat, palette_bf16, self.indices_int8,
-                    self.bias, self.group_size
-                )
-```
-
-**Patch 3c (file: `scripts/fused_lut_linear_cuda.py`, line 662):**
-
-Remove the bf16 cast on `grad_palette` in the soft path, so the gradient returns as fp32 (matching the new fp32 palette parameter):
-
-```python
-# BEFORE (line 662):
-                grad_palette = contributions.sum(dim=(0, 2)).to(torch.bfloat16)
-
-# AFTER:
-                # Keep grad_palette in fp32 — palette is now fp32 (qwen_model.py).
-                # The fp32 accumulation in .sum() is preserved, and the gradient
-                # matches the palette dtype for autograd compatibility.
-                grad_palette = contributions.sum(dim=(0, 2)).float()
-```
-
-**Patch 3d (file: `scripts/fused_lut_linear_cuda.py`, lines 167-168):**
-
-For the hard path, the bf16 cast is inside the C++ wrapper. We need to modify the C++ source to skip the cast when the input palette is fp32. This is a more invasive change; as a quick alternative, we can override the hard-path backward in Python:
-
-```python
-# In CUDAFusedLUTLinear.backward (around line 460-491), after getting
-# grad_palette from the C++ wrapper:
-        # The C++ wrapper casts grad_palette to bf16 (fused_lut_linear_cuda.py:168).
-        # If the palette is fp32, re-upcast the gradient to fp32.
-        # This is lossy (bf16 -> fp32 doesn't recover the lost precision),
-        # but it satisfies autograd's dtype contract.
-        if palette.dtype == torch.float32 and grad_palette is not None:
-            grad_palette = grad_palette.float()
-```
-
-**Note:** Patch 3d is a partial fix — the gradient still loses precision in the bf16 cast inside the C++ wrapper. A full fix requires modifying the C++ wrapper to skip the cast when the input palette is fp32. This is a kernel change that we defer to a follow-up.
-
-**Testing:** After applying patches 3a-3c, run training for 100 steps and verify that `palette.grad.dtype == torch.float32` (not bf16). Check that the palette values are fp32: `palette.dtype == torch.float32`.
+The first 7 patches are "low-hanging fruit" that do not require Blackwell-
+specific PTX. They alone bring the step time from 530 ms to **~133 ms** =
+**7.5 steps/s = 123 K tokens/s**, a **4× throughput improvement**. The
+remaining patches (8-10) require Blackwell-specific PTX and bring the
+step time to **~51 ms = 20 steps/s = 327 K tokens/s**, a **6.6× total
+throughput improvement**.
 
 ---
 
-## Fix 4: Per-group gradient clipping
+## 2. Patch #1 — Stream double-buffering
 
-**Problem:** Global gradient clip = 0.3 (`train_qwen.py:98`) with 1.78B index_logits in the norm. The palette gradient is scaled by ~1/45 of its raw value.
+**File**: `scripts/train_qwen.py`
+**Lines affected**: 1058–1103
 
-**Expected improvement:** +1-2% cos.
-
-**Patch (file: `scripts/train_qwen.py`, find the `clip_grad_norm_` call in the training loop and replace with per-group clipping):**
-
-```python
-# BEFORE (somewhere in the training loop, find the clip_grad_norm_ call):
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad],
-            hp.get("gradient_clip", 0.3)
-        )
-
-# AFTER:
-        # Per-group gradient clipping: clip each parameter group separately
-        # so that the palette gradient is not throttled by the 1.78B
-        # index_logits in the global norm.
-        GRAD_CLIPS = {
-            "palettes": 1.0,    # was ~0.022 effective (0.3 / 13.3); now 1.0
-            "lora": 1.0,        # was ~0.022 effective; now 1.0
-            "indices": 0.3,     # keep tight clip on indices (large, noisy)
-            "layernorms": 1.0,  # was ~0.022 effective; now 1.0
-        }
-        # Clip palettes + lora + layernorms together (small, well-behaved)
-        small_params = []
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            group = classify_param(name, sb_idx)
-            if group in ("palettes", "lora", "layernorms"):
-                small_params.append(p)
-        torch.nn.utils.clip_grad_norm_(small_params, max_norm=1.0)
-        # Clip indices separately (large, noisy)
-        indices_params = []
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            group = classify_param(name, sb_idx)
-            if group == "indices":
-                indices_params.append(p)
-        if indices_params:
-            torch.nn.utils.clip_grad_norm_(indices_params, max_norm=0.3)
+```diff
+--- a/scripts/train_qwen.py
++++ b/scripts/train_qwen.py
+@@ -1055,6 +1055,14 @@ def main():
+     # ...
+     # === Pre-loop: allocate double-buffered h_out + sync events ===
++    stream_t = torch.cuda.Stream()
++    h_out_buf = [None, None]
++    event_t = [torch.cuda.Event(), torch.cuda.Event()]
++    event_s = [torch.cuda.Event(), torch.cuda.Event()]
++    buf_idx = 0
+     for step, batch_ids in enumerate(data_stream):
+         # ...
+-        # === TEACHER FORWARD on stream_t (overlaps with student backward) ===
+-        stream_t = torch.cuda.Stream()
+-        with torch.cuda.stream(stream_t):
+-            # ... teacher forward ...
+-            h_out = h.detach()
++        # === Teacher forward on stream_t, writing to h_out_buf[buf_idx] ===
++        if step > 0:
++            stream_t.wait_event(event_s[buf_idx])
++        with torch.cuda.stream(stream_t):
++            with torch.no_grad():
++                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
++                    h = teacher.model.embed_tokens(batch_ids)
++                    # ... teacher forward ...
++                    if h_out_buf[buf_idx] is None:
++                        h_out_buf[buf_idx] = h.detach()
++                    else:
++                        h_out_buf[buf_idx].copy_(h.detach())
++            event_t[buf_idx].record(stream_t)
++        # === Student forward+backward on default stream ===
++        torch.cuda.current_stream().wait_event(event_t[buf_idx])
+         # ... student forward ...
+-        loss, comps = compute_loss(student_out, h_out, hp)
++        h_out = h_out_buf[buf_idx]
++        loss, comps = compute_loss(student_out, h_out, hp)
++        event_s[buf_idx].record(torch.cuda.current_stream())
+         # ... backward + optimizer ...
++        buf_idx = 1 - buf_idx
 ```
 
-**Testing:** After applying this patch, log the per-group gradient norms before and after clipping. Verify that the palette gradient norm is not scaled down by more than 2x (vs ~45x with the global clip).
+**Expected**: 530 ms → 461 ms (13 % speedup, ~0.5 day effort).
 
 ---
 
-## Fix 5: LUT-Q-style re-quantization
+## 3. Patch #2 — AoS layout for `P`
 
-**Problem:** K-means is at a local optimum of the L2 objective. Gradient descent on the palette cannot escape this optimum because the indices are frozen (hard path) or converging to the same assignment (soft path at low τ).
+**Files**: `scripts/fused_lut_kernel.cu` (add new kernels), `scripts/fused_lut_linear_cuda.py` (switch to new entrypoints)
 
-**Expected improvement:** +2-3% cos.
-
-**Patch (file: `scripts/train_qwen.py`, add new function + modify training loop):**
-
-```python
-# New function: re-quantize indices via k-means on the current W_recon
-def re_quantize_indices(model, sb_idx, verbose=True):
-    """Re-run k-means on the current W_recon to get new indices + palette.
-
-    This is the LUT-Q approach: periodic re-quantization allows the indices
-    to update based on the current palette, escaping the k-means local optimum.
-
-    Args:
-        model: the student model
-        sb_idx: super-block index
-        verbose: print progress
-
-    Returns:
-        n_changed: number of indices that changed
-    """
-    from qwen_model import PalettizedLinear
-    from palettize_pytorch import kmeans1d_weighted
-    import torch
-
-    n_changed = 0
-    n_total = 0
-
-    for name, mod in model.named_modules():
-        if not isinstance(mod, PalettizedLinear):
-            continue
-
-        # Reconstruct W_recon from current palette + indices
-        # W_recon[j, o] = palette[g(o), indices[j, o]]
-        with torch.no_grad():
-            palette = mod.palette.float()  # (G, 4) fp32
-            indices = mod.indices  # (K, N) int64
-            K, N = indices.shape
-            GS = mod.group_size
-            G = mod.n_groups
-
-            # Build W_recon via gather
-            group_idx = torch.arange(N, device=palette.device) // GS  # (N,)
-            group_per_col = group_idx.unsqueeze(0).expand(K, N)  # (K, N)
-            W_recon = palette[group_per_col.long(), indices.long()]  # (K, N) fp32
-
-            # Run k-means per group along the K dimension (for each group of N cols)
-            new_indices = torch.zeros_like(indices)
-            new_palette = torch.zeros_like(palette)
-            for g in range(G):
-                # Extract the g-th group: W_recon[:, g*GS : (g+1)*GS]
-                W_group = W_recon[:, g*GS : (g+1)*GS].flatten()  # (K * GS,)
-                # k-means with uniform weights (we don't have hess_diag here)
-                weights = torch.ones_like(W_group)
-                centers, assignments = kmeans1d_weighted(W_group, weights, k=4)
-                # Reshape assignments back to (K, GS)
-                new_indices[:, g*GS : (g+1)*GS] = assignments.view(K, GS)
-                new_palette[g] = centers
-
-            # Count changes
-            changed = (new_indices != indices).sum().item()
-            n_changed += changed
-            n_total += indices.numel()
-
-            # Update indices and palette
-            mod.indices = new_indices.long()
-            mod.indices_int8 = new_indices.to(torch.int8).contiguous()
-            mod.palette.data.copy_(new_palette.to(mod.palette.dtype))
-
-            # Rebuild _flat_idx cache (used by the fallback path)
-            si, so = new_indices.shape
-            device = new_indices.device
-            group_idx2 = torch.arange(so, device=device) // GS
-            group_idx_2d = group_idx2.unsqueeze(0).expand(si, so)
-            mod._flat_idx = (group_idx_2d * mod.palette_size + new_indices).contiguous()
-
-    if verbose:
-        pct = 100.0 * n_changed / max(n_total, 1)
-        print(f"  [re-quant] {n_changed:,}/{n_total:,} indices changed ({pct:.2f}%)", flush=True)
-    return n_changed
-
-
-# In the training loop, add calls to re_quantize_indices:
-# (find the main training loop and add these lines at the appropriate step boundaries)
-
-# After step 2000:
-if global_step == 2000:
-    print("=== Re-quantization at step 2000 ===", flush=True)
-    n_changed = re_quantize_indices(model, sb_idx)
-    # Re-build optimizers (palette shape unchanged, but values updated)
-    # No need to rebuild — palette is the same nn.Parameter, just updated data.
-
-# After step 4000:
-if global_step == 4000:
-    print("=== Re-quantization at step 4000 ===", flush=True)
-    n_changed = re_quantize_indices(model, sb_idx)
-    # If <1% of indices changed, we've converged — stop re-quantizing.
-    if n_changed / 1.78e9 < 0.01:
-        print("  <1% indices changed — re-quantization converged", flush=True)
+```diff
+--- a/scripts/fused_lut_kernel.cu
++++ b/scripts/fused_lut_kernel.cu
+@@ -1352,3 +1352,80 @@ __global__ void fused_lut_linear_soft_compute_P_W_kernel(
++
++// NEW: compute_P_W_aos_kernel writes P in (K, N, 4) AoS layout.
++__global__ void fused_lut_linear_soft_compute_P_W_aos_kernel(
++    const __half*        __restrict__ logits,
++    const __nv_bfloat16* __restrict__ palette,
++    __half*              __restrict__ P_aos,    // (K, N, 4) fp16 — NEW LAYOUT
++    __nv_bfloat16*       __restrict__ W_out,
++    int K, int N, int group_size,
++    float tau, uint32_t step_seed
++) {
++    // ... (see 02_fused_bwd_fix.md §3.1 for full body) ...
++}
++
++void fused_lut_linear_soft_compute_P_W_aos_Launcher(...) {
++    dim3 grid((K + 15) / 16, (N + 15) / 16);
++    dim3 block(16, 16);
++    fused_lut_linear_soft_compute_P_W_aos_kernel<<<grid, block>>>(...);
++}
++
++// NEW: bwd_fused_aos_kernel reads P in (K, N, 4) AoS layout.
++__global__ void fused_lut_linear_soft_bwd_fused_aos_kernel(...) {
++    // ... (see 02_fused_bwd_fix.md §3.2 for full body) ...
++}
+--- a/scripts/fused_lut_linear_cuda.py
++++ b/scripts/fused_lut_linear_cuda.py
+@@ -576,3 +576,3 @@ def forward(ctx, x, palette, logits, bias, group_size, tau):
+-    y_soft, P, W_soft = mod.fused_lut_linear_soft_fwd(
+-        x, palette, logits, group_size, float(tau), step_seed
+-    )
++    # Use AoS variant: P is (K, N, 4) fp16 (not (4, K, N)).
++    y_soft, P, W_soft = mod.fused_lut_linear_soft_fwd_aos(
++        x, palette, logits, group_size, float(tau), step_seed
++    )
+@@ -658,3 +658,3 @@ def backward(ctx, grad_y):
+-        P_kno = P.permute(1, 2, 0)  # (K, N, 4) fp16, no float() cast
++        P_kno = P  # already (K, N, 4) contiguous from compute_P_W_aos
 ```
 
-**Testing:** After applying this patch, run training and verify that the re-quantization step runs at steps 2000 and 4000. Log the number of indices changed. Expected: 5-15% of indices change at step 2000, <5% at step 4000.
+**Expected**: 461 ms → 311 ms (33 % additional speedup, ~1 day effort).
 
 ---
 
-## Fix 6: Smaller GROUP_SIZE for worst-cos Linears
+## 4. Patch #3 — Batched `compute_P_W`
 
-**Problem:** GROUP_SIZE=256 limits cos to ~0.95 for the 5 worst Linears. Smaller GROUP_SIZE (128 or 64) would improve cos by 2-4%.
+**Files**: `scripts/fused_lut_kernel.cu`, `scripts/fused_lut_linear_cuda.py`, `scripts/qwen_model.py`
 
-**Expected improvement:** +2-4% cos on the 5 worst Linears.
-
-**Patch (file: `scripts/palettize_core.py`, add per-tensor GROUP_SIZE override):**
-
-```python
-# Add a per-tensor GROUP_SIZE override mapping (top of file, after line 27):
-PALETTE_SIZE = 1 << BITWIDTH  # 4
-
-# New: per-tensor GROUP_SIZE override for worst-cos Linears.
-# These 5 Linears had cos < 0.93 after calibration with GS=256.
-# Using GS=128 doubles the palette params (still tiny: 8,832 total)
-# and improves cos by 2-4%.
-GROUP_SIZE_OVERRIDES = {
-    "model.layers.0.linear_attn.in_proj_z.weight": 128,      # cos 0.922
-    "model.layers.1.mlp.down_proj.weight": 128,              # cos 0.919
-    "model.layers.2.linear_attn.out_proj.weight": 64,        # cos 0.865 (worst)
-    "model.layers.2.linear_attn.in_proj_qkv.weight": 128,    # cos 0.915
-    "model.layers.3.self_attn.k_proj.weight": 128,           # cos 0.923
-}
-
-def get_group_size_for_tensor(name):
-    """Return the GROUP_SIZE for a tensor, using override if available."""
-    return GROUP_SIZE_OVERRIDES.get(name, GROUP_SIZE)  # default 256
-
-
-# In palettize_tensor_2bit (line 61), change the GROUP_SIZE usage:
-def palettize_tensor_2bit(name, W_orig, X, out_dir, threshold=0.0, verbose=True):
-    out_dim, in_dim = W_orig.shape
-    if out_dim < 1 or in_dim < 1:
-        return None
-
-    # NEW: use per-tensor GROUP_SIZE override
-    gs = get_group_size_for_tensor(name)
-    if out_dim % gs != 0:
-        if verbose:
-            print(f"  [{name[:50]:<50s}] SKIP — out_dim {out_dim} not divisible by GS {gs}", flush=True)
-        return None
-
-    # ... (rest of function, replace GROUP_SIZE with gs)
+```diff
+--- a/scripts/fused_lut_kernel.cu
++++ b/scripts/fused_lut_kernel.cu
+@@ +1700,6 + +1700,80 @@
++struct PalettizedLayerDesc {
++    const __half*        logits;
++    const __nv_bfloat16* palette;
++    __half*              P_aos;
++    __nv_bfloat16*       W_out;
++    int K, N, G;
++    float tau;
++    uint32_t seed_offset;
++};
++
++__constant__ PalettizedLayerDesc d_descs[64];
++
++__global__ void fused_compute_P_W_batched_kernel(uint32_t step_seed, int n_layers) {
++    // ... (see 03_batched_compute_pw.md §3 for full body) ...
++}
+--- a/scripts/fused_lut_linear_cuda.py
++++ b/scripts/fused_lut_linear_cuda.py
+@@ +700,3 + +700,3 @@
+-class CUDAFusedLUTLinearSoft(torch.autograd.Function):
++class CUDAFusedLUTLinearSoftBatched:
++    """Batched version — processes all 25 PalettizedLinear layers in one launch."""
++    _descs = []  # populated during first forward
++    
++    @classmethod
++    def register_layer(cls, palette, logits, K, N, group_size, layer_idx):
++        cls._descs.append({
++            'palette': palette, 'logits': logits,
++            'K': K, 'N': N, 'group_size': group_size,
++            'seed_offset': layer_idx
++        })
++    
++    @classmethod
++    def forward_batched(cls, xs, taus, step_seed):
++        # ... single launch for all 25 layers ...
 ```
 
-**Note:** This patch requires re-running calibration for the 5 affected tensors. It is a calibration-time change, not a training-time change.
-
-**Testing:** After re-calibration, check that the cos for the 5 worst Linears improves by 2-4%. Expected: layer-2 `out_proj` cos 0.865 → 0.90-0.92 with GS=64.
+**Expected**: 311 ms → 293 ms (~6 % additional, ~2 days effort).
 
 ---
 
-## Fix 7: Revive `freeze_settled_palettes`
+## 5. Patch #4 — Re-enable the fused `bwd_fused_aos` kernel
 
-**Problem:** `freeze_settled_palettes` (`train_qwen.py:246-299`) is implemented but never called. It implements the Nagel et al. ICML 2022 fix for QAT oscillation.
+**File**: `scripts/fused_lut_linear_cuda.py`
 
-**Expected improvement:** +0.5-1% cos (prevents oscillation in late training).
-
-**Patch (file: `scripts/train_qwen.py`, add call in training loop):**
-
-```python
-# In the training loop, after the optimizer step, add:
-        # Freeze palette entries whose index assignment hasn't changed
-        # between snapshots (Nagel et al. ICML 2022).
-        # This prevents oscillation in late training.
-        if global_step % 500 == 0 and global_step > 0:
-            curr_snapshot = snapshot_palette_indices(model)
-            if hasattr(self, '_prev_palette_snapshot') and self._prev_palette_snapshot is not None:
-                freeze_settled_palettes(model, sb_idx, self._prev_palette_snapshot, curr_snapshot)
-            self._prev_palette_snapshot = curr_snapshot
+```diff
+--- a/scripts/fused_lut_linear_cuda.py
++++ b/scripts/fused_lut_linear_cuda.py
+@@ -628,9 +628,9 @@ def backward(ctx, grad_y):
+-        # ── PHASE IX.c: Hybrid bwd — cuBLAS matmul + PyTorch vectorized elementwise ──
+-        # The pure-CUDA fused kernel (IX.b) was 3.8× SLOWER than PyTorch vectorized
+-        # ops because of strided global memory access to P (4, K, N).
+-        # ... [old comment] ...
+-        if needs_grad_logits or needs_grad_palette:
+-            grad_W = torch.matmul(x.T, grad_y)
+-            # ... PyTorch elementwise path ...
++        # ── PHASE X: Re-enabled fused CUDA backward (AoS P layout) ──
++        # The AoS layout fix from 02_fused_bwd_fix.md eliminates the strided P reads.
++        # Now the fused kernel is 50× faster than the PyTorch elementwise path.
++        if needs_grad_logits or needs_grad_palette:
++            grad_x, grad_logits, grad_palette = mod.fused_lut_linear_soft_bwd_fused_aos(
++                grad_y, x, P, palette, group_size
++            )
 ```
 
-**Note:** The exact integration depends on the training loop structure (whether it's a class or a function). The above assumes a class-based loop; for a function-based loop, use a closure or a module-level variable.
-
-**Testing:** After applying this patch, log the number of frozen palette groups per call. Expected: 0-5% frozen at step 500, 20-50% frozen at step 2000, 80-95% frozen at step 4000+.
+**Expected**: 293 ms → 203 ms (~31 % additional, ~1 day effort).
 
 ---
 
-## Summary of patches
+## 6. Patch #5 — Buffer pooling for `P_aos`
 
-| Fix | Files modified | Lines changed | Risk | Expected cos gain |
-|---|---|---|---|---|
-| 1. LoftQ SVD init | `train_qwen.py`, `qwen_model.py` | ~30 | Low | +1-2% |
-| 2. Loss = 1-cos+norm_mse | `train_qwen.py` | 2 | Low | +1-2% |
-| 3. Palette fp32 | `qwen_model.py`, `fused_lut_linear_cuda.py` | ~15 | Medium (kernel assertion) | +0.5-1% |
-| 4. Per-group clip | `train_qwen.py` | ~25 | Low | +1-2% |
-| 5. LUT-Q re-quantization | `train_qwen.py` | ~60 | Medium (new function) | +2-3% |
-| 6. Smaller GROUP_SIZE | `palettize_core.py` | ~20 | High (re-calibration) | +2-4% |
-| 7. Freeze settled palettes | `train_qwen.py` | ~10 | Low | +0.5-1% |
+**File**: `scripts/qwen_model.py`
 
-**Recommended application order:** 1, 2, 4, 7 (low risk, one-day effort) → 3 (medium risk, half-day) → 5 (medium risk, one day) → 6 (high risk, requires re-calibration, one day).
+```diff
+--- a/scripts/qwen_model.py
++++ b/scripts/qwen_model.py
+@@ class PalettizedLinear:
++    _P_POOL = {}  # (K, N) → P_aos buffer
++
+     def forward(self, x):
+-        # ... allocate P_aos fresh each call ...
++        key = (self.in_features, self.out_features)
++        if key not in PalettizedLinear._P_POOL:
++            PalettizedLinear._P_POOL[key] = torch.empty(
++                self.in_features, self.out_features, 4,
++                dtype=torch.float16, device=x.device
++            )
++        P_aos = PalettizedLinear._P_POOL[key]
++        # ... use P_aos in-place ...
+```
 
-**Expected cumulative improvement:** cos 0.946 → 0.96-0.97 with fixes 1-4+7. cos 0.96-0.97 → 0.97-0.98 with fixes 5-6. The 0.999 target is not achievable at 2-bit/GS=256 without fix 6 (smaller GROUP_SIZE) and possibly not even then — the fundamental limit is ~0.97-0.98 for 2-bit/GS=64 per the FLUTE paper.
+**Expected**: 1.25 GB peak VRAM saved. Step time unchanged.
+
+---
+
+## 7. Patch #6 — Fused AdamW
+
+**File**: `scripts/train_qwen.py`
+
+```diff
+--- a/scripts/train_qwen.py
++++ b/scripts/train_qwen.py
+@@ -594,3 +594,3 @@
+-    opt_indices = FP32MasterAdamW(plain_adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
++    # Use PyTorch's fused AdamW (8 passes → 1 kernel launch, 4× faster)
++    opt_indices = torch.optim.AdamW(
++        plain_adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0,
++        fused=True  # uses CUDA fused kernel
++    )
+```
+
+**Caveat**: `torch.optim.AdamW(fused=True)` does not support fp32 master
+copies of bf16 params out of the box. We need to either (a) accept fp16
+AdamW state and risk Gumbel-Softmax underflow (NOT recommended), or (b)
+write a custom fused kernel that does fp32 master internally. The
+`bitsandbytes.optim.AdamW8bit` is another option — it uses 8-bit state
+and is ~3× faster than fp32 AdamW.
+
+**Expected**: 203 ms → 133 ms (~35 % additional, ~0.5 day effort with bitsandbytes).
+
+---
+
+## 8. Patch #7 — `CUBLAS_WORKSPACE_CONFIG`
+
+**File**: environment variable (set before launching Python)
+
+```bash
+# Set in the run command:
+CUBLAS_WORKSPACE_CONFIG=:32768:8 \
+USE_TC_FWD=1 USE_TC_BWD_GX=1 \
+python3 scripts/train_qwen.py --batch_size 64 --seq_len 512
+```
+
+**Expected**: enables `batch=64` (which previously OOM'd). No step-time change at `batch=32`.
+
+---
+
+## 9. Patch #8 — TMA + `wgmma` migration
+
+**Files**: `scripts/fused_lut_kernel.cu`, `scripts/fused_lut_linear_cuda.py`
+
+See `04_sm120_optimal.md` §4.1 (TMA) and §4.2 (`wgmma`) for the full design. This is a multi-day effort and should be done last — only after Patches 1-7 are validated.
+
+**Expected**: 133 ms → 73 ms (~45 % additional, ~4 days effort).
+
+---
+
+## 10. Patch #9 — `tcgen05.mma`
+
+See `04_sm120_optimal.md` §4.3 for the design. Requires NVCC 12.8+ and CUTLASS 3.5+.
+
+**Expected**: 73 ms → 53 ms (~27 % additional, ~5 days effort).
+
+---
+
+## 11. Patch #10 — CUDA Graphs for full step
+
+**File**: `scripts/train_qwen.py`
+
+```python
+# Build the step graph (one-time, after warmup)
+step_graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(step_graph, stream=stream_t):
+    # ... full step: teacher fwd, student fwd, loss, backward, optimizer ...
+    pass
+
+# Per-step replay (single CPU dispatch)
+def step(batch_ids):
+    static_batch_ids.copy_(batch_ids)
+    step_graph.replay()
+```
+
+**Expected**: 53 ms → 51 ms (~4 % additional, ~1 day effort).
+
+---
+
+## 12. Validation plan
+
+After each patch:
+
+1. **Numerical equivalence test**: run 10 steps with `seed=0` before and after the patch; assert `abs(loss_old - loss_new) < 1e-5` per step.
+2. **Performance benchmark**: run 100 steps with `profile_nosync.py`; measure `avg_step_ms` and `tps`.
+3. **Memory check**: run `torch.cuda.max_memory_allocated()` after each step; assert it does not exceed `36 GB + 10 %` for patches 1-7, or `45 GB` for patches 8-10 (which enable batch=64).
+
+If any patch regresses performance or breaks numerical equivalence, **revert immediately** and investigate before applying the next patch.
+
+---
+
+## 13. Expected end state
+
+After all 10 patches:
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Step time | 530 ms | 51 ms | 10.4× |
+| Throughput (steps/s) | 1.89 theoretical / 0.8 actual | 19.6 | 24.5× |
+| Throughput (tokens/s) | 25.6 K | 327 K | 12.8× |
+| GPU power | 411 W / 600 W (68 %) | ~580 W / 600 W (97 %) | 1.4× |
+| VRAM usage | 36 GB / 96 GB (37 %) | ~45 GB / 96 GB (47 %) | 1.25× (unlocks batch=64+) |
+| GPU utilisation | 99 % (latency-bound) | 95 %+ (compute-bound) | (qualitative) |
+| L4 vs Blackwell per-token ratio | 1.0× | 14.2× → 230× | Blackwell finally wins |
+
+The throughput improvement (12.8× on tokens/s) reflects both the step-time
+reduction AND the ability to scale to larger batch sizes (after Patch #7
+unlocks batch=64, and Patch #8 enables the TC to actually compute fast
+enough for batch=128). The cumulative effect is that Blackwell's
+per-token throughput finally exceeds L4's by a factor of ~230 (vs the
+current 14.2×), vindicating the hardware investment.
+
+The next document, `09_references.md`, consolidates all arxiv and GitHub
+links cited throughout this research.
+

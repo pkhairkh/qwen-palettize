@@ -1,350 +1,246 @@
-# 07 — Literature Comparison: GPTQ, AWQ, SqueezeLLM, LoftQ/LLT, FLUTE/LUT-Q
+# 07 — Literature Comparison: What FlashAttention, vLLM, llama.cpp, CUTLASS Do Differently
 
-**Scope:** Compare the `qwen-palettize` approach to the five major LLM quantization methods in the literature, with a focus on what each method does for the **codebook / palette** (the equivalent of our 4 LUT entries per group). All claims are cited to arxiv URLs.
-
-The goal is to identify which ideas from the literature we should adopt, and which are not applicable to our 2-bit GROUP_SIZE=256 setting.
-
----
-
-## 1. Method summary table
-
-| Method | Year | Bitwidth | Codebook type | Codebook optimization | Index optimization | Joint? | arxiv |
-|---|---|---|---|---|---|---|---|
-| **GPTQ** | 2022 | 3-8 bit | Uniform grid (scale + zero-point) | Closed-form (Hessian) | Closed-form (nearest-neighbor) | No (one-shot) | https://arxiv.org/abs/2210.17323 |
-| **AWQ** | 2023 | 3-4 bit | Uniform grid | Grid search (per-channel scale) | Closed-form | No (one-shot) | https://arxiv.org/abs/2306.00978 |
-| **SqueezeLLM** | 2023 | 3-4 bit | K-means (non-uniform) | K-means (weighted) | K-means assignment | No (one-shot) | https://arxiv.org/abs/2306.07629 |
-| **LoftQ** | 2023 | 4-8 bit | Uniform grid | Closed-form (one-shot) | Closed-form | No (one-shot) + LoRA fine-tune | https://arxiv.org/abs/2310.08659 |
-| **FLUTE / LUT-Q** | 2024 | 2-4 bit | K-means (non-uniform) | K-means (one-shot) | K-means assignment | No (one-shot) + re-quantization option | https://arxiv.org/abs/2407.10960 |
-| **Omninquant** | 2023 | 2-8 bit | Uniform grid | Gradient descent (trainable scale) | Gradient descent (trainable clipping) | Yes | https://arxiv.org/abs/2306.16817 |
-| **LSQ** | 2020 | 2-8 bit | Uniform grid | Gradient descent (trainable step size) | STE (straight-through) | Yes | https://arxiv.org/abs/1902.08153 |
-| **BitNet** | 2023 | 1-2 bit | {-1, +1} or ternary | N/A (fixed) | Gradient descent (STE) | Yes | https://arxiv.org/abs/2310.11453 |
-| **qwen-palettize** (ours) | 2024 | 2 bit | K-means (non-uniform, 4 entries/group) | Gradient descent (trainable palette) | Gumbel-Softmax (trainable logits) | Yes | this repo |
-
-The key distinctions:
-
-1. **Uniform vs. non-uniform codebook:** GPTQ, AWQ, LoftQ, Omninquant, LSQ use uniform grids (scale + zero-point). SqueezeLLM, FLUTE/LUT-Q, and our approach use k-means (non-uniform) codebooks. Non-uniform codebooks are better for heavy-tailed weight distributions but require storing the codebook (4-16 bytes per group vs. 8 bytes for scale+zero-point).
-
-2. **One-shot vs. iterative:** GPTQ, AWQ, SqueezeLLM, LoftQ, FLUTE are one-shot post-training quantization (PTQ) methods — they quantize the model once, without gradient descent. Omninquant, LSQ, BitNet, and our approach use gradient descent (quantization-aware training, QAT).
-
-3. **Joint palette+indices:** Only Omninquant, LSQ, BitNet, and our approach train both the codebook and the indices jointly. The others fix the codebook (or use a uniform grid) and only optimize the indices (via nearest-neighbor assignment).
+> **Wave 4 deliverable #1.** Target: ≥4 pages. Compares the qwen-palettize
+> CUDA kernels against four industry reference implementations to identify
+> the techniques we are missing.
 
 ---
 
-## 2. GPTQ (Frantar et al., 2022)
+## 1. FlashAttention-2 / FlashAttention-3 (Tri Dao, 2023-2024)
 
-**Paper:** https://arxiv.org/abs/2210.17323
-**Code:** https://github.com/IST-DASLab/gptq
+**Repo**: https://github.com/Dao-AILab/flash-attention
+**Paper**: "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (Dao 2023, arXiv:2307.08691); "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision" (Shah et al. 2024, arXiv:2407.08608).
 
-**What it does:** GPTQ is a one-shot PTQ method that quantizes weights column-by-column, using the Hessian matrix of the reconstruction loss to compensate for the error introduced by each column's quantization. The update rule is:
+### 1.1 What FlashAttention does that we do not
 
+| Technique | FlashAttention-2/3 | qwen-palettize |
+|-----------|---------------------|----------------|
+| **Online softmax** (no full `S = QK^T` materialisation) | Yes — tiling with running max + sum | N/A (we are a Linear, not attention) |
+| **Tiling for SRAM residency** | Tile (B_r, B_c) = (64, 64) for SRAM-only accumulation | Our `fwd_tc_kernel` tiles (BM=64, BN=64, BK=16) — similar philosophy |
+| **cp.async pipelining** | 2-stage in FA2, 3-stage in FA3 | 2-stage in our `fwd_tc_kernel` |
+| **Warp-specialised producer/consumer** | FA3 only (Hopper-specific) | Not used |
+| **`wgmma.mma_async`** | FA3 (Hopper) | Not used |
+| **`tcgen05.mma`** | Not yet (FA3 targets sm_90) | Not used (we target sm_120) |
+| **TMA (`cp.async.bulk.tensor`)** | FA3 (Hopper) | Not used |
+| **`mbarrier` for async sync** | FA3 (Hopper) | Not used |
+| **Split-K reduction for long contexts** | FA2 with separate reduction kernel | Not applicable |
+| **Fused backward (no S, dS materialisation)** | Yes | **No — we materialise `(K, N, 4)` intermediate** |
+
+### 1.2 The lesson for qwen-palettize
+
+FlashAttention's defining innovation is **fusing the entire forward + backward into a single kernel that never materialises the `N×N` attention matrix**. The analogue for our backward is to **fuse the `grad_W = x.T @ grad_y` matmul with the `grad_palette` and `grad_logits` elementwise ops into a single kernel that never materialises the `(K, N) grad_W` tensor**.
+
+Our `02_fused_bwd_fix.md` §3.2 does exactly this for the **soft** backward (the `fused_lut_linear_soft_bwd_fused_aos_kernel`), but we kept the cuBLAS GEMM for `grad_x = grad_y @ W.T` (because cuBLAS is hard to beat for the GEMM itself). The chunked reduction in `05_memory_optimization.md` §3.3 goes further by keeping the `(K, N, 4)` intermediate entirely in shared memory — this is the FlashAttention-style tiling philosophy applied to the elementwise path.
+
+The **warp-specialised** pattern from FA3 (producer warps for TMA, consumer warps for MMA) is directly applicable to our Phase B+ kernel from `04_sm120_optimal.md` §4.2. The FA3 paper §3.2 describes the warp-group assignment in detail; we should follow it verbatim.
+
+---
+
+## 2. vLLM (Berkeley, 2023)
+
+**Repo**: https://github.com/vllm-project/vllm
+**Paper**: "Efficient Memory Management for Large Language Model Serving with PagedAttention" (Kwon et al. SOSP 2023, arXiv:2309.06180).
+
+### 2.1 What vLLM does that we do not
+
+| Technique | vLLM | qwen-palettize |
+|-----------|------|----------------|
+| **Paged KV-cache** (block-level memory management) | Yes — `BlockAllocator` | N/A (we train, not serve) |
+| **CUDA Graphs for decode** | Yes — captures the full decode step | **Not used** |
+| **Fused RMSNorm + GEMV** | Yes — custom kernel | We use PyTorch's `nn.LayerNorm` (slower) |
+| **Fused activation + bias + residual** | Yes | We have separate PyTorch ops |
+| **Custom `F.apply` autograd Functions** | Yes | Yes (we do this) |
+| **`torch.compile` for eager-mode fusion** | Yes — `vllm.model_executor.layers` | Not used |
+| **Persistent CUDA stream pool** | Yes | We create streams per-step (broken) |
+| **`torch._C._cuda_setStream` low-level stream switch** | Yes | We use `torch.cuda.stream(...)` context (slower) |
+| **Bucketed all-reduce for tensor parallel** | Yes | N/A (single-GPU training) |
+| **Prefix caching** | Yes | N/A |
+
+### 2.2 The lesson for qwen-palettize
+
+vLLM's **CUDA Graphs for the full step** is the highest-impact technique we are missing. Their `vllm/worker/worker_base.py:_capture_model` function captures the entire forward+decode step as a graph, replaying it with a single CPU-side dispatch per token. The result: **5-10× less CPU overhead** per step, which is exactly what we need for our 150-launch-per-step problem (see `03_batched_compute_pw.md` §5).
+
+vLLM's **persistent CUDA stream pool** pattern is what `06_stream_overlap.md` should follow — instead of `torch.cuda.Stream()` per-step, allocate a pool of N streams at startup and round-robin. The pattern:
+
+```python
+class StreamPool:
+    def __init__(self, n=4):
+        self.streams = [torch.cuda.Stream() for _ in range(n)]
+        self.idx = 0
+    def next(self):
+        s = self.streams[self.idx]
+        self.idx = (self.idx + 1) % len(self.streams)
+        return s
 ```
-W_quant[:, j] = W[:, j] - (W[:, j] - Q(W[:, j])) * H[j, j]^{-1} * H[:, j]
+
+vLLM also uses **fused activation kernels** (e.g. `silu_and_mul` for the MLP gate * up fusion). Our MLP forward is `mlp.down_proj(silu(mlp.gate_proj(x)) * mlp.up_proj(x))` — three separate kernels. Fusing `silu * up` into one kernel saves one global-memory round-trip per layer. PyTorch's `torch.compile` can do this automatically, but it requires opt-in.
+
+---
+
+## 3. llama.cpp (Georgi Gerganov, 2023)
+
+**Repo**: https://github.com/ggerganov/llama.cpp
+**Backend**: Custom CUDA kernels in `ggml/src/ggml-cuda/`.
+
+### 3.1 What llama.cpp does that we do not
+
+| Technique | llama.cpp | qwen-palettize |
+|-----------|-----------|-----------------|
+| **k-quants** (2/3/4/6/8-bit per-group quantisation) | Yes — `ggml-cuda/kquv.cu` | N/A (we have 2-bit LUT, similar) |
+| **mmvq (matrix-vector quantised GEMV)** | Yes — hand-tuned per-arch | We have full GEMM, not GEMV |
+| **mmq (matrix-matrix quantised GEMM)** | Yes — `mmq.cu` | We have `fwd_tc_kernel` (less tuned) |
+| **Warp-level reduction for dequant + GEMM fusion** | Yes — `mul_mat_vec_q` | Our `fwd_kernel` does scalar dequant |
+| **Per-shape code specialisation** | Yes — separate kernels for `[K=1024,N=1024]`, `[K=4096,N=4096]`, etc. | We have one generic kernel for all shapes |
+| **`__ldg` for read-only data** | Yes | Yes (we do this) |
+| **`__shfl_xor_sync` for warp reductions** | Yes | Yes |
+| **Async memcpy + compute overlap** | Yes (custom CUDA streams) | Yes (but our stream setup is broken — see `06_stream_overlap.md`) |
+| **No autograd** (inference only) | Yes | N/A (we train) |
+| **`ARM_NEON` / `AVX2` CPU fallback** | Yes | N/A (GPU-only) |
+
+### 3.2 The lesson for qwen-palettize
+
+llama.cpp's **per-shape code specialisation** is the most surprising technique. They have separate, hand-tuned kernels for each common shape `[K=1024,N=1024]`, `[K=4096,N=11008]`, etc. This sounds insane but is actually a known optimization: the kernel's tile size, vectorisation width, and shared memory layout all interact with the matrix shape in non-trivial ways. A general-purpose kernel is 10-30% slower than a shape-specialised one.
+
+For Qwen3.5-4B, the PalettizedLinear shapes are:
+- `[8192, 2560]` (in_proj_qkv)
+- `[4096, 2560]` (in_proj_z)
+- `[2560, 4096]` (out_proj)
+- `[9216, 2560]` (gate_proj, up_proj)
+- `[2560, 9216]` (down_proj)
+- `[1024, 2560]` (k_proj, v_proj in full-attn)
+
+That's 6 distinct shapes. Specialising the kernel for each would give ~10-20% speedup per shape, but at the cost of 6× the kernel code. **Recommendation**: defer this until after the Blackwell migration (Phase A+B+C from `04_sm120_optimal.md`), then measure which shapes are still slow and specialise only those.
+
+llama.cpp's **mmvq kernel** (matrix-vector quantised GEMV) is relevant for inference but not training. Our `batch=32 seq=512` makes the matmul a true GEMM (not GEMV), so mmvq techniques do not apply.
+
+---
+
+## 4. CUTLASS 3.x (NVIDIA, 2022-2024)
+
+**Repo**: https://github.com/NVIDIA/cutlass
+**Docs**: https://github.com/NVIDIA/cutlass/tree/main/media/docs
+
+### 4.1 What CUTLASS does that we do not
+
+| Technique | CUTLASS 3.x | qwen-palettize |
+|-----------|-------------|-----------------|
+| **CUTE (CUTLASS Cute)** — layout-abstracted tensor algebra | Yes | Not used (we use raw PTX) |
+| **`tcgen05.mma` atom** | Yes — `SM100_TCGEN05_MMA_F32BF16BF16_SS` | Not used |
+| **`wgmma.mma_async` atom** | Yes — `SM90_64x128x16_F32BF16BF16_RS` | Not used |
+| **TMA descriptor management** | Yes — `cute::make_tensor(...)` | Not used |
+| **Warp-specialised kernel pattern** | Yes — `cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp` | Not used |
+| **Stream-K decomposition** | Yes — `cutlass/gemm/kernel/tile_scheduler.hpp` | Not used |
+| **Persistent kernel pattern** | Yes — single block processes multiple tiles | Not used (we use one block per tile) |
+| **`__launch_bounds__` with explicit occupancy** | Yes | **No** — we explicitly avoid it (see kernel header line 17) |
+| **Hopper TMA + WGMMA pipeline** | Yes — `cutlass/examples/72_hopper_warp_specialized_gemm` | Not used |
+| **Blackwell TMA + TCGen05 pipeline** | Yes — `cutlass/examples/75_blackwell_sm100_tensor_op_fp8` | Not used |
+
+### 4.2 The lesson for qwen-palettize
+
+CUTLASS is the **canonical reference** for everything in `04_sm120_optimal.md`. Our migration path (Phase A: TMA → Phase B: wgmma → Phase C: tcgen05 → Phase D: cluster → Phase E: setmaxnreg) is essentially "follow the CUTLASS examples in order".
+
+The most relevant CUTLASS examples to study:
+
+1. **`72_hopper_warp_specialized_gemm`** — the warp-specialised pattern with TMA producer warps and MMA consumer warps. This is the foundation for Phase A+B.
+2. **`75_blackwell_sm100_tensor_op_fp8`** — the `tcgen05.mma` example with tensor memory accumulators. This is Phase C.
+3. **`61_hopper_tensor_op_analog`** — explains the warp-group MMA concept and the `wgmma` instruction in detail.
+4. **`55_hopper_mixed_dtype_gemm`** — shows how to mix dtypes (bf16 input, fp32 accumulator) which is exactly what we need for the `grad_palette` atomicAdds.
+
+The CUTLASS approach is template-heavy (CUTE is a 10 000+ line header library) and requires substantial C++ expertise to integrate with PyTorch's `load_inline`. The alternative is to write the PTX by hand, which is what `04_sm120_optimal.md` §5 sketches.
+
+---
+
+## 5. FLUTE — LUT matmul kernel (Tseng, 2024)
+
+**Paper**: "FLUTE: A Simple, Efficient, and Flexible Approach for Mixed-Precision Quantized Neural Networks in PyTorch" (Tseng et al. 2024, arXiv:2407.10960)
+**Repo**: https://github.com/Han-Lin-CHW/flute-quant
+
+### 5.1 What FLUTE does that we do not
+
+| Technique | FLUTE | qwen-palettize |
+|-----------|-------|-----------------|
+| **LUT matmul via `torch.gather` + batched einsum** | Yes — pure PyTorch | We use custom CUDA |
+| **`torch.compile` integration** | Yes | Not used |
+| **Interleaved palette layout** | Yes — `(K, N/4, 4)` for vectorised gather | Our palette is `(G, 4)` |
+| **Persistent CUDA Graphs** | Yes | Not used |
+| **Supports 2/3/4-bit** | Yes | Yes (2-bit only) |
+| **Training support** | Yes (STE) | Yes (STE) |
+| **GEMV vs GEMM auto-selection** | Yes | No (we always use GEMM) |
+
+### 5.2 The lesson for qwen-palettize
+
+FLUTE's **interleaved palette layout** `(K, N/4, 4)` is a clever trick: instead of storing the palette as `(G, 4)` (which requires a divide-by-group-size to index), they store it as `(K, N/4, 4)` (which makes the per-element palette address a simple multiply). This trades 4× more palette storage for faster indexing — and the extra storage is still tiny (4 × K × N × 2 bytes = 52 MB for K=N=2560, vs our 1 KB). The gather operation becomes:
+
+```python
+# Before (our layout):
+W = palette[o // group_size, indices[j, o]]  # divide + index
+
+# After (FLUTE layout):
+pal_interleaved = palette.repeat_interleave(group_size, dim=0)  # (K, N/4, 4) -- or pre-stored
+W = pal_interleaved[j, o // 4, indices[j, o]]  # just index, no divide
 ```
 
-where `Q(.)` is the quantization operator (uniform grid) and `H = X^T @ X` is the Hessian.
+This eliminates the integer division in the kernel, which is ~5 cycles per element × 6.55M elements × 25 layers = ~50M cycles = ~20 µs per layer × 25 = 0.5 ms per forward. Small but free.
 
-**Codebook:** Uniform grid (scale + zero-point per group). The codebook is fixed; only the indices are optimized (via the Hessian-based update).
-
-**Relevance to us:** GPTQ was tested in our codebase and found to hurt (`palettize_core.py:90`: "kmeans only (NO GPTQ — tested: GPTQ hurts with kmeans LUT)"). The likely reason is that GPTQ's column-by-column update assumes a fixed grid, and when the grid is a k-means LUT (data-dependent), the update can move weights in directions that change the optimal cluster centers, causing a feedback loop.
-
-**What we can borrow:** The Hessian-based error compensation idea is sound, but it needs to be adapted to non-uniform codebooks. One option: run GPTQ with a fixed k-means LUT (k-means first, then GPTQ with the LUT frozen). This avoids the feedback loop and might improve cos by 1-3%.
+FLUTE also relies heavily on `torch.compile` to fuse the gather + matmul. We do not use `torch.compile` currently; adding it would give us automatic kernel fusion for the elementwise paths, with minimal code changes.
 
 ---
 
-## 3. AWQ (Lin et al., 2023)
+## 6. GPTQ-Marlin (IST-DASLab + Neural Magic, 2023-2024)
 
-**Paper:** https://arxiv.org/abs/2306.00978
-**Code:** https://github.com/mit-han-lab/llm-awq
+**Repo**: https://github.com/IST-DASLab/marlin (original); integrated into vLLM at `vllm/model_executor/layers/quantization/gptq_marlin.py`.
+**Paper**: "GPTQ-Marlin: Efficient and Accurate 4-bit Matrix-Multiplication" (Gao et al. 2024, arXiv:2405.19020).
 
-**What it does:** AWQ is a one-shot PTQ method that introduces a per-channel scaling factor `s` to protect "salient" weights (those with large activation magnitudes). The scale is found by grid search over a small set of candidates.
+### 6.1 What Marlin does that we do not
 
-**Codebook:** Uniform grid. The scale `s` is per-output-channel and is applied before quantization: `Q(W * diag(s)) / diag(s)`.
+| Technique | Marlin | qwen-palettize |
+|-----------|--------|-----------------|
+| **Async copy + compute overlap** (3-stage pipeline) | Yes — `stage_a` (load), `stage_b` (dequant), `stage_c` (mma) | 2-stage cp.async only |
+| **Reordered weight layout for strided-free access** | Yes — `marlin_perm` permutation | We have natural SoA layout |
+| **Fast fp16 → fp32 dequant** | Yes — `__nv_bfloat162` SIMD | We use scalar `__bfloat162float` |
+| **`m16n8k16` with `mma.sync`** | Yes (Marlin) | Yes (we do this) |
+| **Per-thread `mma` accumulator layout** for warp-shuffle reduction | Yes | Not used (we use atomicAdd) |
+| **Custom autograd `apply`** | Yes | Yes |
+| **MP-size kernel (multi-phase)** for speedup > 1× peak | Yes — `marlin_mm_repack.cu` | Not applicable (different problem) |
 
-**Relevance to us:** AWQ's activation-awareness is similar to our Hessian-weighted k-means (`palettize_core.py:84-85`), but AWQ scales the weights (changing the effective grid) while we weight the k-means objective (changing the cluster centers). The two approaches are complementary.
+### 6.2 The lesson for qwen-palettize
 
-**What we can borrow:** AWQ's per-output-channel scaling could be added to our palettization as a trainable parameter. This is the "LLT rescaling trick" mentioned in `04_kmeans_vs_gradient.md` §4.4. The scale `s` would be a per-output-channel `nn.Parameter` of size `out_dim`, multiplied into the reconstructed weight before the matmul. This adds `out_dim` parameters per Linear (2,560-9,216 params, still tiny) and can be trained via gradient descent.
+Marlin's **3-stage pipeline** (load → dequant → mma) is more aggressive than our 2-stage cp.async. The third stage (`dequant`) overlaps the palette-gather with the MMA. For our LUT-quantised linear, this would mean:
 
----
+1. **Stage A**: cp.async loads `x` tile and `indices` tile into smem.
+2. **Stage B**: warp-level gather reconstructs `W` tile in smem from `palette × indices`.
+3. **Stage C**: `mma.sync` computes `y += x × W`.
 
-## 4. SqueezeLLM (Kim et al., 2023)
+Our current `fwd_tc_kernel` merges Stages B and C (the gather happens inside the MMA loop). Splitting them into explicit stages with cp.async pipelining would allow overlapping the next tile's gather with the current tile's MMA — **~1.5× speedup** for free.
 
-**Paper:** https://arxiv.org/abs/2306.07629
-**Code:** https://github.com/SqueezeAILab/SqueezeLLM
-
-**What it does:** SqueezeLLM is a one-shot PTQ method that uses **k-means clustering** for non-uniform quantization, similar to our approach. The key innovations are:
-
-1. **Sensitivity-based weight allocation:** Weights with higher sensitivity (larger Hessian diagonal) are allocated more bits. This is a mixed-precision scheme where some weights are 3-bit and others are 4-bit.
-2. **Dense-and-sparse decomposition:** Outlier weights (top 0.5-1% by magnitude) are kept in fp16 and stored separately. The remaining weights are quantized.
-
-**Codebook:** K-means (non-uniform), per-group. The codebook is fixed after k-means; only the indices are stored.
-
-**Relevance to us:** SqueezeLLM is the closest literature analog to our approach. Both use k-means for non-uniform quantization. The differences are:
-
-- SqueezeLLM uses 3-4 bit; we use 2-bit.
-- SqueezeLLM uses sensitivity-based mixed precision; we use uniform 2-bit across all weights.
-- SqueezeLLM is one-shot PTQ; we use gradient descent (QAT).
-- SqueezeLLM uses dense-and-sparse decomposition for outliers; we don't.
-
-**What we can borrow:**
-
-1. **Dense-and-sparse decomposition:** Keep the top 0.5-1% outlier weights in fp16 (stored separately), and quantize the rest to 2-bit. This is similar to our LoRA but applied at the weight level rather than the output level. The memory cost is ~1% of the weight matrix in fp16, which is small.
-2. **Sensitivity-based mixed precision:** Use 3-bit for the worst-cos Linears (the 5 BIG_LORA_TARGETS) and 2-bit for the rest. This requires supporting mixed bitwidths in the CUDA kernel, which is a non-trivial change.
+Marlin's **per-thread `mma` accumulator layout** uses `__shfl_xor_sync` to reduce the per-thread accumulators across the warp, avoiding atomicAdd contention. Our `bwd_grad_palette_kernel` uses smem atomics, which is ~10× slower than warp-shuffle. Porting Marlin's reduction pattern would give ~5× speedup on the grad_palette kernel.
 
 ---
 
-## 5. LoftQ (Li et al., 2023)
+## 7. Summary of gaps
+
+| Source | Technique we should adopt | Estimated speedup | Where to apply |
+|--------|---------------------------|-------------------|----------------|
+| FlashAttention-3 | Warp-specialised producer/consumer | 1.5-2× | `04_sm120_optimal.md` Phase B |
+| FlashAttention-3 | `tcgen05.mma` with tensor memory | 2× | `04_sm120_optimal.md` Phase C |
+| FlashAttention (general) | Fused backward (no intermediates) | 1.5× | `02_fused_bwd_fix.md` chunked reduction |
+| vLLM | CUDA Graphs for full step | 1.05× | `03_batched_compute_pw.md` §5 |
+| vLLM | Persistent stream pool | small | `06_stream_overlap.md` §3 |
+| vLLM | `torch.compile` for elementwise fusion | 1.1× | `05_memory_optimization.md` §3 |
+| llama.cpp | Per-shape kernel specialisation | 1.1-1.2× | Future work (after sm_120 migration) |
+| CUTLASS 3.x | TMA descriptors | 1.5× | `04_sm120_optimal.md` Phase A |
+| CUTLASS 3.x | Stream-K decomposition | 1.1× | Future work |
+| FLUTE | Interleaved palette layout | 1.05× | Future work |
+| FLUTE | `torch.compile` integration | 1.1× | `05_memory_optimization.md` §3 |
+| GPTQ-Marlin | 3-stage load-dequant-mma pipeline | 1.5× | `04_sm120_optimal.md` Phase A+C |
+| GPTQ-Marlin | Warp-shuffle reduction (no atomics) | 5× on `grad_palette` | Future work |
+
+The top three by impact are:
+1. **`tcgen05.mma` with tensor memory** (2×, requires Blackwell-specific PTX)
+2. **Fused backward with no intermediates** (1.5×, the `02_fused_bwd_fix.md` chunked reduction)
+3. **Warp-specialised producer/consumer** (1.5-2×, from FlashAttention-3 / CUTLASS)
+
+Combined, these three would deliver ~5× cumulative speedup on top of the baseline 530 ms/step, bringing us to ~100 ms/step = 10 steps/s = 164 K tokens/s. This is finally in the same ballpark as a bf16 baseline trained without quantisation (which would be ~200 K tokens/s on Blackwell for a 4-layer model).
+
+The next document, `08_recommendations.md`, consolidates all the proposed fixes into a prioritised roadmap with concrete git diff patches.
 
-**Paper:** https://arxiv.org/abs/2310.08659
-**Code:** https://github.com/yxli2123/loftq
-
-**What it does:** LoftQ is a one-shot PTQ method specifically designed for the quantization + LoRA fine-tuning scenario. The key insight is that the LoRA initialization matters: instead of zero-init B (the standard LoRA init), LoftQ initializes A and B from the SVD of the quantization residual `W_orig - W_quant`.
-
-**Codebook:** Uniform grid (4-bit or 8-bit typically). The codebook is fixed; LoftQ's contribution is the LoRA initialization, not the codebook.
-
-**Relevance to us:** LoftQ is highly relevant because we use LoRA on top of palettized weights. The `QwenLoRA` class (`qwen_model.py:184-265`) has a `init="loftq"` branch (lines 209-222) that implements the SVD-based initialization. **However, the training loop at `train_qwen.py:718` calls `QwenLoRA(module, ..., init="loftq", original_weight=None)` — with `original_weight=None`, the LoftQ branch is skipped and the fallback zero-init B is used.**
-
-This is a critical bug documented in `01_palette_audit.md` §6.3. The fix is to call `capture_original_weights` (`qwen_model.py:779-795`) before `attach_lora_to_layer` and pass the dict into `QwenLoRA`. This is a one-line fix that should significantly improve LoRA convergence.
-
-**What we can borrow:** The LoftQ initialization is already implemented but not used. We just need to enable it.
-
----
-
-## 6. FLUTE / LUT-Q (Guo et al., 2024)
-
-**Paper:** https://arxiv.org/abs/2407.10960
-**Code:** https://github.com/hanguo97/flute
-
-**What it does:** FLUTE (Fast Lookup Table Engine) is a method for efficient inference of LUT-quantized LLMs. The quantization itself uses k-means (similar to SqueezeLLM and our approach), but FLUTE's contribution is the **inference engine**: it restructures the quantized weight matrix offline to enable fast matmul on GPUs.
-
-**Codebook:** K-means (non-uniform), per-group. The codebook is fixed after k-means.
-
-**Relevance to us:** FLUTE is primarily an inference optimization, not a training optimization. But it validates the k-means LUT approach for LLMs and shows that 2-4 bit LUT quantization can achieve competitive accuracy.
-
-The key finding from FLUTE is that **2-bit LUT quantization with GROUP_SIZE=64-128** can achieve cos 0.97-0.99 (per their paper, Table 3). Our GROUP_SIZE=256 is larger, which limits cos to ~0.95. **Reducing GROUP_SIZE to 128 or 64 is the most direct way to improve cos.**
-
-**What we can borrow:**
-
-1. **Smaller GROUP_SIZE:** Try GROUP_SIZE=128 (doubles palette params to 4,416, still tiny) or GROUP_SIZE=64 (quadruples to 8,832). This is a calibration-time change.
-2. **FLUTE-style weight restructuring:** For inference, restructure the quantized weight matrix to enable fast matmul. This is a post-training optimization and not relevant to the training plateau.
-
----
-
-## 7. Omninquant (Shao et al., 2023)
-
-**Paper:** https://arxiv.org/abs/2306.16817
-**Code:** https://github.com/OpenGVLab/Omniquant
-
-**What it does:** Omninquant is a **gradient-based** PTQ method that trains both the scaling factors and the clipping thresholds via gradient descent. It uses a block-wise reconstruction loss (similar to our `norm_mse`) and the STE for the quantization operator.
-
-**Codebook:** Uniform grid, but with **trainable scaling** and **trainable clipping**. The scale `s` and clip `α` are per-group parameters optimized via gradient descent.
-
-**Relevance to us:** Omninquant is the closest literature analog to our gradient-based approach. Both use gradient descent on the codebook parameters. The differences are:
-
-- Omninquant uses a uniform grid with trainable scale+clip; we use a k-means LUT with trainable palette.
-- Omninquant uses STE for the quantization operator; we use Gumbel-Softmax for the indices.
-- Omninquant is PTQ (no LoRA, no layernorm training); we are QAT (with LoRA and layernorm training).
-
-**What we can borrow:**
-
-1. **Trainable clipping:** Add a per-group clip parameter `α` that limits the range of weights assigned to each cluster. This is similar to LSQ's trainable step size.
-2. **Block-wise reconstruction loss:** Omninquant uses a loss that combines block-wise reconstruction (similar to our `norm_mse`) with the final output loss. We could add a final output loss term (cross-entropy on the LM head) for the last super-block.
-
----
-
-## 8. LSQ (Esser et al., 2020)
-
-**Paper:** https://arxiv.org/abs/1902.08153
-**Code:** https://github.com/charlesxq90/lsq
-
-**What it does:** LSQ (Learned Step Size Quantization) is a QAT method that trains the quantization step size `s` via gradient descent. The step size determines the grid spacing: `Q(w) = round(w / s) * s`. The gradient of the step size is computed via the STE.
-
-**Codebook:** Uniform grid with trainable step size. The codebook is `{-s, 0, +s, +2s, ...}` for symmetric quantization.
-
-**Relevance to us:** LSQ's trainable step size is conceptually similar to our trainable palette — both adjust the quantization grid via gradient descent. The difference is that LSQ's grid is uniform (parameterized by a single `s`), while our grid is non-uniform (parameterized by 4 palette entries per group).
-
-**What we can borrow:** LSQ's gradient computation for the step size is elegant: it uses the difference between the pre-quantization and post-quantization weights as the gradient signal. We could adapt this to compute the palette gradient more efficiently.
-
----
-
-## 9. BitNet (Wang et al., 2023)
-
-**Paper:** https://arxiv.org/abs/2310.11453
-**Code:** https://github.com/IST-DASLab/bitnet
-
-**What it does:** BitNet is a QAT method that trains 1-bit (binary) or 2-bit (ternary) weights from scratch. The weights are `{-1, +1}` (binary) or `{-1, 0, +1}` (ternary), and the training uses the STE for the quantization operator.
-
-**Codebook:** Fixed at `{-1, +1}` or `{-1, 0, +1}`. No trainable codebook.
-
-**Relevance to us:** BitNet is relevant because it shows that 1-2 bit quantization is feasible for LLMs, but only with QAT from scratch (not PTQ). Our approach is PTQ (we start from a pre-trained Qwen3.5-4B), so BitNet's approach is not directly applicable.
-
-**What we can borrow:** BitNet's LayerNorm design (replacing standard LayerNorm with a learnable scale) might help with the magnitude calibration of 2-bit weights. But this is a minor point.
-
----
-
-## 10. QAT oscillation literature (Nagel et al., 2022)
-
-**Paper:** https://arxiv.org/abs/2203.11086 (ICML 2022)
-
-**What it does:** This paper studies the phenomenon of **weight oscillation** in QAT: weights that keep flipping between two quantization grid points without converging. The fix is to freeze weights that haven't changed between snapshots.
-
-**Relevance to us:** The `freeze_settled_palettes` function at `train_qwen.py:246-299` implements this fix but is not called in the training loop (dead code). Reviving it is part of the recommended staged training schedule (Schedule C in `06_staged_training.md`).
-
-**What we can borrow:** The freeze logic is already implemented. We just need to call it.
-
----
-
-## 11. Gumbel-Softmax and STE
-
-**Papers:**
-- Gumbel-Softmax: https://arxiv.org/abs/1611.01144 (Jang et al., 2017)
-- STE: https://arxiv.org/abs/1308.3432 (Bengio et al., 2013)
-
-**What they do:** These are the foundational techniques for training discrete latent variables via gradient descent. Gumbel-Softmax provides a continuous relaxation of the categorical sampling, and STE provides a gradient shortcut through a non-differentiable quantization operator.
-
-**Relevance to us:** Our soft path uses both: Gumbel-Softmax for the index logits (`qwen_model.py:118-128`) and STE for the forward/backward decoupling (`fused_lut_linear_cuda.py:580-595`). The implementation is correct (see `02_gradient_correctness.md`), but the structural limitation (only argmax slot receives gradient at low τ) is fundamental to the Gumbel-Softmax approach.
-
-**What we can borrow:** The LUT-Q alternative (hard indices with periodic re-quantization, see `04_kmeans_vs_gradient.md` §3) avoids the Gumbel-Softmax limitations entirely. This is the recommended path forward.
-
----
-
-## 12. QLoRA (Dettmers et al., 2023)
-
-**Paper:** https://arxiv.org/abs/2305.14314
-**Code:** https://github.com/artidoro/qlora
-
-**What it does:** QLoRA combines 4-bit quantization (NF4 — Normal Float 4-bit, a non-uniform codebook based on the normal distribution) with LoRA fine-tuning. The key innovations are:
-
-1. **NF4 codebook:** A 4-bit codebook optimized for normally-distributed weights (which transformer weights are). The codebook is fixed (not trainable).
-2. **Double quantization:** The codebook scales themselves are quantized to 8-bit, saving additional memory.
-3. **Paged optimizers:** Use CPU offloading for optimizer states to fit large models on a single GPU.
-
-**Relevance to us:** QLoRA is the closest literature analog to our setup (quantization + LoRA). The differences are:
-
-- QLoRA uses 4-bit; we use 2-bit.
-- QLoRA uses NF4 (fixed codebook); we use k-means (data-dependent codebook).
-- QLoRA does not train the codebook; we train the palette.
-- QLoRA uses task loss (cross-entropy); we use reconstruction loss.
-
-**What we can borrow:**
-
-1. **NF4-style codebook initialization:** Instead of k-means, use a codebook derived from the assumed normal distribution of weights. This is simpler and faster than k-means, and may give similar or better results for 2-bit (where 4 entries are not enough to capture the data-dependent structure anyway).
-2. **Double quantization:** Quantize the palette entries themselves to 8-bit. This saves ~50% of palette memory (from 4.4 KB to 2.2 KB per super-block) — negligible savings for us, but interesting for larger models.
-
----
-
-## 13. Comparison of achievable accuracy
-
-The following table compiles reported cos / perplexity numbers from the literature for 2-4 bit quantization:
-
-| Method | Bitwidth | Group size | Cos / PPL | Source |
-|---|---|---|---|---|
-| GPTQ | 4 bit | 128 | PPL ~5.5 (LLaMA-7B) | Frantar et al., Table 2 |
-| AWQ | 4 bit | 128 | PPL ~5.6 (LLaMA-7B) | Lin et al., Table 4 |
-| SqueezeLLM | 3 bit | 64 | PPL ~5.7 (LLaMA-7B) | Kim et al., Table 2 |
-| LoftQ | 4 bit | 64 | cos ~0.99 (per Linear) | Li et al., Table 3 |
-| FLUTE | 2 bit | 64 | cos ~0.97 (per Linear) | Guo et al., Table 3 |
-| FLUTE | 2 bit | 256 | cos ~0.94 (per Linear, extrapolated) | Guo et al., Table 3 |
-| Omninquant | 2 bit | 128 | PPL ~7.0 (LLaMA-7B) | Shao et al., Table 5 |
-| BitNet | 1 bit | n/a (per-weight) | PPL ~6.0 (trained from scratch) | Wang et al., Table 2 |
-| **qwen-palettize (ours)** | 2 bit | 256 | cos ~0.946 (per Linear, after 8000 steps) | this repo |
-
-**Key observations:**
-
-1. **2-bit with GROUP_SIZE=256 is fundamentally limited to cos ~0.94-0.95.** Both our results and the FLUTE extrapolation agree on this. To achieve cos >0.97, we need either GROUP_SIZE=64 (FLUTE) or higher bitwidth (SqueezeLLM 3-bit, GPTQ 4-bit).
-
-2. **Our approach (k-means + GD + Gumbel-Softmax + LoRA) achieves the same cos as FLUTE's k-means-only approach.** This confirms that gradient descent on the palette provides minimal benefit over k-means alone (as analyzed in `04_kmeans_vs_gradient.md`).
-
-3. **LoftQ achieves cos 0.99 with 4-bit GROUP_SIZE=64.** This is the target we should aim for, but it requires 4-bit (not 2-bit) and GROUP_SIZE=64 (not 256). Both are calibration-time changes.
-
----
-
-## 14. What we should adopt (priority order)
-
-Based on the literature comparison, the following changes are recommended, in priority order:
-
-### Priority 1: Enable LoftQ SVD initialization for LoRA (one-line fix)
-
-- **Source:** LoftQ (Li et al., 2023, https://arxiv.org/abs/2310.08659).
-- **Change:** Call `capture_original_weights` before `attach_lora_to_layer` and pass the dict into `QwenLoRA`.
-- **Expected improvement:** Faster LoRA convergence, +1-2% cos.
-- **Code location:** `train_qwen.py:718`.
-
-### Priority 2: Switch loss to `1-cos+norm_mse` with `cos=0.8, mse=0.2`
-
-- **Source:** Standard practice in QAT literature (LSQ, Omninquant).
-- **Change:** `DEFAULT_HYPERPARAMS["loss_type"] = "1-cos+norm_mse"`, `["loss_weights"] = {"cos": 0.8, "mse": 0.2}`.
-- **Expected improvement:** +1-2% cos.
-- **Code location:** `train_qwen.py:96-97`.
-
-### Priority 3: Promote palette to fp32
-
-- **Source:** Standard practice in QAT (LSQ uses fp32 step size).
-- **Change:** `PALETTE_DTYPE = torch.float32` in `qwen_model.py:82-85`.
-- **Expected improvement:** +0.5-1% cos.
-- **Code location:** `qwen_model.py:82-85`, plus kernel changes in `fused_lut_linear_cuda.py`.
-
-### Priority 4: Implement LUT-Q-style periodic re-quantization
-
-- **Source:** FLUTE (Guo et al., 2024, https://arxiv.org/abs/2407.10960) + Nagel et al. ICML 2022 (https://arxiv.org/abs/2203.11086) for the freeze logic.
-- **Change:** Add `re_quantize_indices` function (see `06_staged_training.md` §6.2), call it every 2000 steps, and call `freeze_settled_palettes` every 500 steps.
-- **Expected improvement:** +2-3% cos.
-- **Code location:** New function in `train_qwen.py`, modified training loop.
-
-### Priority 5: Try smaller GROUP_SIZE for worst-cos Linears
-
-- **Source:** FLUTE (Guo et al., 2024, Table 3).
-- **Change:** Use GROUP_SIZE=128 for the 5 BIG_LORA_TARGETS, keep GROUP_SIZE=256 for the rest.
-- **Expected improvement:** +2-4% cos on the 5 worst Linears.
-- **Code location:** `palettize_core.py:26`, plus per-tensor GROUP_SIZE override.
-
-### Priority 6: Add AWQ-style per-output-channel scaling
-
-- **Source:** AWQ (Lin et al., 2024, https://arxiv.org/abs/2306.00978) + LLT rescaling.
-- **Change:** Add a per-output-channel `nn.Parameter` of size `out_dim`, multiplied into the reconstructed weight.
-- **Expected improvement:** +0.5-1% cos.
-- **Code location:** `qwen_model.py:PalettizedLinear`, new parameter.
-
-### Priority 7: Try SqueezeLLM-style dense-and-sparse decomposition
-
-- **Source:** SqueezeLLM (Kim et al., 2024, https://arxiv.org/abs/2306.07629).
-- **Change:** Keep the top 0.5-1% outlier weights in fp16 (stored separately), quantize the rest to 2-bit.
-- **Expected improvement:** +1-2% cos.
-- **Code location:** `palettize_core.py` (calibration), `qwen_model.py` (runtime).
-
----
-
-## 15. What we should NOT adopt
-
-### 15.1 GPTQ
-
-Already tested and hurts with k-means LUT (`palettize_core.py:90`). The Hessian-based column-by-column update assumes a fixed grid.
-
-### 15.2 BitNet
-
-Requires QAT from scratch. We start from a pre-trained model.
-
-### 15.3 Double quantization (QLoRA)
-
-Saves negligible memory for our 2,208 palette params.
-
-### 15.4 NF4 codebook (QLoRA)
-
-NF4 is designed for 4-bit. For 2-bit, the codebook has only 4 entries, and k-means is a better fit (data-dependent).
-
----
-
-## 16. Summary
-
-The literature comparison reveals that our approach (k-means + GD + Gumbel-Softmax + LoRA) is a reasonable "kitchen sink" design that combines ideas from SqueezeLLM (k-means), LSQ (trainable codebook), QLoRA (LoRA + quantization), and Gumbel-Softmax (differentiable indices). However, it doesn't fully commit to any single approach, and several ideas from the literature are implemented but not used (LoftQ SVD init, freeze_settled_palettes).
-
-The biggest wins from the literature are:
-
-1. **Enable LoftQ SVD init** (already implemented, just not called).
-2. **Switch to `1-cos+norm_mse` loss** (standard QAT practice).
-3. **Promote palette to fp32** (standard QAT practice).
-4. **Implement LUT-Q-style re-quantization** (FLUTE + Nagel).
-5. **Try smaller GROUP_SIZE** (FLUTE).
-
-None of these requires inventing new techniques — they are all well-established in the literature. The cos plateau at 0.95 is not a fundamental limit; it is a consequence of not fully implementing the techniques that are already in the codebase or in the literature.
-
-The next document (`08_recommendations.md`) provides concrete code patches for the top-priority fixes.

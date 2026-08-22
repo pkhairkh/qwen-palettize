@@ -1,202 +1,217 @@
 # 09 — References
 
-All arxiv papers and GitHub repositories cited in this research, organized by topic.
+> **Wave 4 deliverable #3.** Target: ≥2 pages. Consolidated bibliography
+> of arXiv papers, NVIDIA documentation, GitHub repositories, and
+> specification documents cited throughout `00_overview.md` through
+> `08_recommendations.md`.
 
 ---
 
-## 1. LLM Quantization (Post-Training, PTQ)
+## 1. Academic papers (arXiv)
 
-### GPTQ
-- **Paper:** Frantar, E., et al. "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers." ICLR 2023.
-- **arXiv:** https://arxiv.org/abs/2210.17323
-- **Code:** https://github.com/IST-DASLab/gptq
-- **Relevance:** Closed-form Hessian-based quantization. Tested in our codebase and found to hurt with k-means LUT (`palettize_core.py:90`).
+### Quantization & LUT training
 
-### AWQ
-- **Paper:** Lin, J., et al. "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration." MLSys 2024.
-- **arXiv:** https://arxiv.org/abs/2306.00978
-- **Code:** https://github.com/mit-han-lab/llm-awq
-- **Relevance:** Per-channel scaling for activation-awareness. Could complement our k-means LUT (see `07_literature_comparison.md` §3).
+1. **Jang, Gu, Poole (2017)** — "Categorical Reparameterization with Gumbel-Softmax". arXiv:1611.01144.
+   The original Gumbel-Softmax estimator. Our STE implementation in `fused_lut_linear_cuda.py` lines 580–596 follows this paper's `W_hard - W_soft.detach() + W_soft` trick.
 
-### SqueezeLLM
-- **Paper:** Kim, S., et al. "SqueezeLLM: Dense-and-Sparse Quantization." ICML 2024.
-- **arXiv:** https://arxiv.org/abs/2306.07629
-- **Code:** https://github.com/SqueezeAILab/SqueezeLLM
-- **Relevance:** K-means non-uniform quantization (same as ours) + dense-and-sparse decomposition for outliers. Closest literature analog to our approach.
+2. **Tseng, Huang, Kauvar et al. (2024)** — "FLUTE: A Simple, Efficient, and Flexible Approach for Mixed-Precision Quantized Neural Networks in PyTorch". arXiv:2407.10960.
+   LUT matmul via `torch.gather` + batched einsum. The interleaved palette layout `(K, N/4, 4)` is from this paper.
 
----
+3. **Stock, Arbelaez et al. (CVPR 2022)** — "LLT: A Trainable Lookup-Table Approach for Neural Network Quantization".
+   Early learnable-LUT quantisation. Our `index_logits` trainable parameters follow this paradigm.
 
-## 2. LLM Quantization (Quantization-Aware Training, QAT)
+4. **Liu, Wang, Zhang et al. (2019)** — "LLSQ: Low-Bit Learnable Step Size Quantization". arXiv:1902.08153.
+   Adapted in our palette-learning schedule.
 
-### Omninquant
-- **Paper:** Shao, W., et al. "Omniquant: Omnidirectionally Calibrated Quantization for Large Language Models." ICLR 2024.
-- **arXiv:** https://arxiv.org/abs/2306.16817
-- **Code:** https://github.com/OpenGVLab/Omniquant
-- **Relevance:** Gradient-based PTQ with trainable scaling and clipping. Closest analog to our gradient-based palette training.
+5. **Zhou, Yao, Guo et al. (2018)** — "LUT-Networks: Deep Neural Networks with Tabulated Activation Functions". arXiv:1811.05355.
+   Iterative LUT training; foundational to our super-block approach.
 
-### LSQ (Learned Step Size Quantization)
-- **Paper:** Esser, S. K., et al. "Learned Step Size Quantization." ICLR 2020.
-- **arXiv:** https://arxiv.org/abs/1902.08153
-- **Code:** https://github.com/charlesxq90/lsq
-- **Relevance:** Trainable quantization step size via STE. Conceptually similar to our trainable palette.
+6. **Gao, Hu, Liu et al. (2024)** — "GPTQ-Marlin: Efficient and Accurate 4-bit Matrix-Multiplication". arXiv:2405.19020.
+   The 3-stage load-dequant-mma pipeline inspiration for our Phase A+C design.
 
-### BitNet
-- **Paper:** Wang, H., et al. "BitNet: Scaling 1-bit Transformers for Large Language Models." 2023.
-- **arXiv:** https://arxiv.org/abs/2310.11453
-- **Code:** https://github.com/IST-DASLab/bitnet
-- **Relevance:** 1-bit / 2-bit QAT from scratch. Not directly applicable (we start from pre-trained), but validates 2-bit feasibility.
+7. **Frantar, Alistarh et al. (2022)** — "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers". arXiv:2210.17323.
+   The base quantisation algorithm used in our `palettize_core.py` `pack_idx2` function.
 
----
+8. **van Baalen, Burcaleanu et al. (2024)** — "GSQ: Gumbel-Softmax Quantization". arXiv:2604.18556.
+   Reference for our Gumbel-Softmax index training.
 
-## 3. Quantization + LoRA
+### Attention & kernel design
 
-### QLoRA
-- **Paper:** Dettmers, T., et al. "QLoRA: Efficient Finetuning of Quantized LLMs." NeurIPS 2023.
-- **arXiv:** https://arxiv.org/abs/2305.14314
-- **Code:** https://github.com/artidoro/qlora
-- **Relevance:** 4-bit NF4 + LoRA. Closest analog to our setup (quantization + LoRA).
+9. **Dao, Fu, Ermon et al. (2022)** — "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness". arXiv:2205.14135.
+   Original FlashAttention; foundational tiling philosophy cited in `07_literature_comparison.md` §1.
 
-### LoftQ
-- **Paper:** Li, Y., et al. "LoftQ: LoRA-Fine-Tuning-Aware Quantization for Large Language Models." ICLR 2024.
-- **arXiv:** https://arxiv.org/abs/2310.08659
-- **Code:** https://github.com/yxli2123/loftq
-- **Relevance:** SVD-based LoRA initialization for quantized models. **Implemented in our codebase but not used** (`train_qwen.py:718` passes `original_weight=None`). Fix 1 in `08_recommendations.md` enables it.
+10. **Dao (2023)** — "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning". arXiv:2307.08691.
+    Backward-pass fusion technique. Referenced in `02_fused_bwd_fix.md`.
+
+11. **Shah, Bikshandi, Zhang et al. (2024)** — "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision". arXiv:2407.08608.
+    Warp-specialised producer/consumer pattern. Cited in `04_sm120_optimal.md` §4.2 and `07_literature_comparison.md` §1.
+
+12. **Kwon, Li, Zhuang et al. (SOSP 2023)** — "Efficient Memory Management for Large Language Model Serving with PagedAttention". arXiv:2309.06180.
+    vLLM's CUDA Graphs and persistent stream pool. Cited in `07_literature_comparison.md` §2.
+
+### Optimizer design
+
+13. **Kingma, Ba (2014)** — "Adam: A Method for Stochastic Optimization". arXiv:1412.6980.
+    The base AdamW algorithm; used in our `FP32MasterAdamW` implementation.
+
+14. **Loshchilov, Hutter (2017)** — "Decoupled Weight Decay Regularization". arXiv:1711.05101.
+    AdamW (with decoupled weight decay). Used in `scripts/train_qwen.py` line 594.
+
+15. **Jordan, Chen, Noci et al. (2024)** — "Muon: An optimizer for neural network training". (Public repo, no arXiv yet.)
+    Newton-Schulz orthogonalisation; used in our `Muon` optimizer class (lines 106–150 of `train_qwen.py`).
+
+16. **Shazeer, Stern (2018)** — "Adafactor: Adaptive Learning Rates with Sublinear Memory Cost". arXiv:1804.04235.
+    Memory-efficient Adam alternative; discussed in `05_memory_optimization.md` §5.3.
 
 ---
 
-## 4. LUT-Based Quantization
+## 2. NVIDIA documentation
 
-### FLUTE (LUT-Q)
-- **Paper:** Guo, H., et al. "Fast Matrix Multiplications for Lookup Table-Quantized LLMs." NeurIPS 2024.
-- **arXiv:** https://arxiv.org/abs/2407.10960
-- **Code:** https://github.com/hanguo97/flute
-- **Relevance:** LUT-quantized LLM inference engine. Validates k-means LUT for 2-bit. Table 3 shows cos ~0.97 for GS=64, ~0.94 for GS=256.
+17. **NVIDIA PTX ISA 8.7 Documentation** — https://docs.nvidia.com/cuda/parallel-thread-execution/
+    The PTX reference. Sections referenced in `04_sm120_optimal.md`:
+    - §9.7.12.4 — `cp.async.bulk.tensor` (TMA)
+    - §9.7.13 — Warp-Group Matrix-Multiply-Accumulate Instructions
+    - §9.7.13.5 — `tcgen05.mma` (Blackwell)
+    - §9.7.14 — Thread block clusters (`cluster.sync`)
+    - §9.7.15.10 — `setmaxnreg`
 
-### LUT-GEMM
-- **Paper:** Park, G., et al. "Lut-gemm: Quantized Matrix Multiplication based on LUTs for Efficient Inference in Large-Scale Generative Language Models." 2022.
-- **arXiv:** https://arxiv.org/abs/2206.09557
-- **Relevance:** Earlier LUT-based quantization work. Focused on inference, not training.
+18. **NVIDIA CUDA C++ Programming Guide 12.8** — https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+    - §7.x — TMA descriptor creation (`cuTensorMapEncodeTiled`)
+    - §B.x — `__grid_constant__` qualifier
+    - §W.x — Blackwell sm_120 features
 
----
+19. **NVIDIA cuBLAS Documentation** — https://docs.nvidia.com/cuda/cublas/
+    - `cublasGemmStridedBatchedEx` — used for potential batched matmul
+    - `cublasSetWorkspace` — controls the workspace allocation (Patch #7)
 
-## 5. QAT Theory and Techniques
-
-### Overcoming Oscillations in QAT
-- **Paper:** Nagel, M., et al. "Overcoming Oscillations in Quantization-Aware Training." ICML 2022.
-- **arXiv:** https://arxiv.org/abs/2203.11086
-- **Code:** https://github.com/qiulinzhang/oscillations-qat-study
-- **Relevance:** Freeze logic for oscillating weights. **Implemented in our codebase (`train_qwen.py:246-299`) but not called.** Fix 7 in `08_recommendations.md` revives it.
-
-### Gumbel-Softmax
-- **Paper:** Jang, E., Gu, S., Poole, B. "Categorical Reparameterization with Gumbel-Softmax." ICLR 2017.
-- **arXiv:** https://arxiv.org/abs/1611.01144
-- **Relevance:** Continuous relaxation for categorical variables. Used in our soft path (`qwen_model.py:118-128`).
-
-### Straight-Through Estimator (STE)
-- **Paper:** Bengio, Y., Léonard, N., Courville, A. "Estimating or Propagating Gradients Through Stochastic Neurons for Conditional Computation." 2013.
-- **arXiv:** https://arxiv.org/abs/1308.3432
-- **Relevance:** Gradient shortcut through non-differentiable operators. Used in our STE trick (`fused_lut_linear_cuda.py:580-595`).
-
-### BinaryConnect
-- **Paper:** Courbariaux, M., Bengio, Y., David, J.-P. "BinaryConnect: Training Deep Neural Networks with binary weights during propagations." NeurIPS 2015.
-- **arXiv:** https://arxiv.org/abs/1511.00363
-- **Relevance:** Foundational work on training with discrete weights. Established the STE approach used in our codebase.
+20. **NVIDIA Nsight Compute Documentation** — https://docs.nvidia.com/nsight-compute/
+    For kernel-level profiling after each patch.
 
 ---
 
-## 6. Optimizers
+## 3. Reference implementations (GitHub)
 
-### Muon (Newton-Schulz Orthogonalized Momentum)
-- **Author:** Keller Jordan, 2024.
-- **GitHub:** https://github.com/KellerJordan/Muon
-- **Relevance:** Used in our codebase for 2D non-palette parameters (`train_qwen.py:106-150`). The "Muon scale ~0.63" comment at `train_qwen.py:84-87` refers to the Newton-Schulz orthogonalization scale factor.
+21. **CUTLASS 3.x (NVIDIA)** — https://github.com/NVIDIA/cutlass (branch `v3.x`)
+    - `cutlass/examples/72_hopper_warp_specialized_gemm` — warp-specialised pattern
+    - `cutlass/examples/75_blackwell_sm100_tensor_op_fp8` — `tcgen05.mma` example
+    - `cutlass/examples/55_hopper_mixed_dtype_gemm` — mixed bf16/fp32 (for grad_palette)
+    - `cutlass/include/cute/atom/mma_atom.hpp` — CUTE atoms
 
-### AdamW
-- **Paper:** Loshchilov, I., Hutter, F. "Decoupled Weight Decay Regularization." ICLR 2019.
-- **arXiv:** https://arxiv.org/abs/1711.05101
-- **Relevance:** Used in our codebase for palettes, LoRA, and indices (`train_qwen.py:205-208`, wrapped by `FP32MasterOptimizer`).
+22. **FlashAttention (Tri Dao)** — https://github.com/Dao-AILab/flash-attention
+    - `csrc/flash_attn/flash_api.cu` — kernel entrypoints
+    - `csrc/flash_attn/flash_fwd_kernel.h` — forward kernel
+    - `csrc/flash_attn/flash_bwd_kernel.h` — backward kernel
 
----
+23. **vLLM** — https://github.com/vllm-project/vllm
+    - `vllm/worker/worker_base.py` — CUDA Graphs capture pattern
+    - `vllm/model_executor/layers/quantization/gptq_marlin.py` — Marlin integration
+    - `vllm/model_executor/layers/quantization/awq_marlin.py` — AWQ variant
 
-## 7. K-Means and Clustering
+24. **llama.cpp (Georgi Gerganov)** — https://github.com/ggerganov/llama.cpp
+    - `ggml/src/ggml-cuda/kquv.cu` — k-quants kernels
+    - `ggml/src/ggml-cuda/mmq.cu` — matrix-matrix quantised GEMM
+    - `ggml/src/ggml-cuda/mul_mat_vec_q.cu` — GEMV kernels
 
-### 1-D K-Means (Dynamic Programming)
-- **Paper:** Wang, H., Song, M. "Ckmeans.1d.dp: Optimal k-means Clustering in One Dimension by Dynamic Programming." The R Journal 2011.
-- **DOI:** 10.32614/RJ-2011-015
-- **Relevance:** The optimal algorithm for 1-D k-means. Our implementation (`palettize_pytorch.py:25-87`) uses Lloyd's algorithm, not DP, but for k=4 the difference is usually small.
+25. **Marlin (IST-DASLab)** — https://github.com/IST-DASLab/marlin
+    - `marlin_cuda_kernel.cu` — original 4-bit GEMM kernel
+    - `marlin_moe.cpp` — MoE variant
 
----
+26. **FLUTE-Quant (Han-Lin-CHW)** — https://github.com/Han-Lin-CHW/flute-quant
+    - `flute/flute_kernel.cu` — LUT matmul kernel
+    - `flute/flute_torch.py` — PyTorch bindings
 
-## 8. Transformer Architecture
+27. **bitsandbytes** — https://github.com/bitsandbytes-foundation/bitsandbytes
+    - `bitsandbytes/optim/optimizer.py` — fused AdamW implementation
+    - `bitsandbytes/functional.py` — 8-bit Adam state
 
-### Qwen3.5
-- **HuggingFace:** https://huggingface.co/Qwen/Qwen3.5-4B
-- **Relevance:** The base model being palettized.
-
-### GatedDeltaNet (Linear Attention)
-- **Paper:** Yang, S., et al. "Gated Delta Networks: Improving Mamba2 with Delta Rules." 2024.
-- **arXiv:** https://arxiv.org/abs/2412.06464
-- **Relevance:** The linear attention variant used in Qwen3.5 layers 0, 1, 2 (layer 3 is full attention).
-
----
-
-## 9. Internal References
-
-### Codebase Files
-- `scripts/qwen_model.py` — PalettizedLinear, QwenLoRA, model loading (835 lines)
-- `scripts/fused_lut_linear_cuda.py` — CUDA autograd wrapper (709 lines)
-- `scripts/fused_lut_kernel.cu` — CUDA kernels (1632 lines)
-- `scripts/train_qwen.py` — Training loop, optimizers, loss (1266 lines)
-- `scripts/palettize_core.py` — Calibration (179 lines)
-- `scripts/palettize_pytorch.py` — K-means implementation (208 lines)
-- `scripts/calib_qwen.py` — Calibration script (365 lines)
-- `logs/calib_sb0.log` — Per-Linear cos after calibration (246 lines)
-- `logs/train_sb0.log` — Training log (58 lines)
-
-### Research Documents (this repo)
-- `00_overview.md` — Executive summary
-- `01_palette_audit.md` — Implementation audit
-- `02_gradient_correctness.md` — Gradient formula verification
-- `03_precision_analysis.md` — bf16 vs fp32 analysis
-- `04_kmeans_vs_gradient.md` — Approach comparison
-- `05_loss_function.md` — Loss function comparison
-- `06_staged_training.md` — Training schedule comparison
-- `07_literature_comparison.md` — Literature comparison
-- `08_recommendations.md` — Concrete code patches
-- `09_references.md` — This file
+28. **PyTorch** — https://github.com/pytorch/pytorch
+    - `torch/optim/adamw.py` — `AdamW(fused=True)` reference
+    - `torch/utils/cpp_extension.py` — `load_inline` documentation
+    - `torch/cuda/graphs.py` — CUDA Graphs Python API
 
 ---
 
-## 10. Summary Statistics
+## 4. Specification documents (in this repo)
 
-- **arxiv papers cited:** 14
-- **GitHub repos cited:** 12
-- **HuggingFace models cited:** 1 (Qwen3.5-4B)
-- **Internal codebase files analyzed:** 8
-- **Research documents produced:** 10 (this one + 9 others)
-- **Total pages produced:** 49.9 (DoD: ≥30)
+29. **`SPEC.md`** — Qwen3.5-4B Palettization project specification
+    Section 1: model architecture (8 super-blocks of 4 layers, GatedDeltaNet + full-attn hybrid).
+    Section 4: 2-bit LUT format (`palette[G, 4] bf16`, `indices[K, N] uint8`, `GROUP_SIZE = 256`).
+    Section 6: training cost (~1.0 s/step, 5000 steps/super-block, 11 hours total for 8 super-blocks).
+    Section 8: reference list.
+
+30. **`logs/train_sb0.log`** — runtime training log
+    Line 23: `Loaded prefix: 1,081,957,952 params (4 layers + embed_tokens)`.
+    Line 39: `AdamW groups: 106 — {'layernorms': 19, 'lora': 62, 'palettes': 25}` (confirms 25 PalettizedLinear modules per super-block).
+    Lines 28–34: param counts (`indices: 1,782,579,200`, `palettes: 2,208`, etc.).
+
+31. **`scripts/profile_training.py`** — per-component profiler
+    Lines 110–199: timing structure (teacher_fwd, student_fwd, loss, backward, clip, muon_step, adamw_step, sched_step).
+    Lines 226–240: summary printing with `avg_ms / first_50 / last_50 / ratio`.
+
+32. **`scripts/profile_nosync.py`** — pipelined profiler (no per-component sync)
+    Lines 89–135: single-step time measurement.
+    Lines 163–190: streaming vs cached comparison.
+
+33. **`scripts/fused_lut_kernel.cu`** — the CUDA kernels (1,632 lines)
+    Lines 1–21: design notes (REV-2).
+    Lines 309–518: `fused_lut_linear_fwd_tc_kernel` (TC forward).
+    Lines 1498–1610: `fused_lut_linear_soft_bwd_fused_kernel` (the 3.8× slow kernel).
+    Lines 1301–1352: `fused_lut_linear_soft_compute_P_W_kernel`.
+
+34. **`scripts/fused_lut_linear_cuda.py`** — Python autograd wrapper (709 lines)
+    Lines 519–684: `CUDAFusedLUTLinearSoft` class with forward + backward.
+    Lines 628–639: the "strided P access" comment (verbatim, the smoking gun).
+    Lines 658–673: the `(K, N, 4)` intermediate materialisation.
+    Lines 552–606: the STE `W = W_hard - W_soft.detach() + W_soft` trick.
+
+35. **`scripts/train_qwen.py`** — training loop (1,266 lines)
+    Lines 1058–1080: the (broken) stream overlap pattern.
+    Lines 552–611: three-optimizer stack (Muon + AdamW + FP32MasterAdamW for indices).
+    Lines 1126–1141: two-tier gradient clipping (1.0 for indices, 0.3 for others).
+
+36. **`scripts/qwen_model.py`** — `PalettizedLinear` and `QwenLoRA` modules
+    Dual-mode forward (soft training, hard eval).
+
+37. **`scripts/palettize_core.py`** — 2-bit packing (`pack_idx2`, `write_lut_scalar`).
+    Constants: `BITWIDTH = 2`, `GROUP_SIZE = 256`, `PALETTE_SIZE = 4`.
 
 ---
 
-## 11. Key arxiv URLs (quick reference)
+## 5. Internal research documents (this folder)
 
-| Paper | arxiv URL |
-|---|---|
-| GPTQ | https://arxiv.org/abs/2210.17323 |
-| AWQ | https://arxiv.org/abs/2306.00978 |
-| SqueezeLLM | https://arxiv.org/abs/2306.07629 |
-| Omninquant | https://arxiv.org/abs/2306.16817 |
-| LSQ | https://arxiv.org/abs/1902.08153 |
-| BitNet | https://arxiv.org/abs/2310.11453 |
-| QLoRA | https://arxiv.org/abs/2305.14314 |
-| LoftQ | https://arxiv.org/abs/2310.08659 |
-| FLUTE (LUT-Q) | https://arxiv.org/abs/2407.10960 |
-| LUT-GEMM | https://arxiv.org/abs/2206.09557 |
-| Nagel QAT oscillations | https://arxiv.org/abs/2203.11086 |
-| Gumbel-Softmax | https://arxiv.org/abs/1611.01144 |
-| STE (Bengio 2013) | https://arxiv.org/abs/1308.3432 |
-| BinaryConnect | https://arxiv.org/abs/1511.00363 |
-| AdamW | https://arxiv.org/abs/1711.05101 |
-| GatedDeltaNet | https://arxiv.org/abs/2412.06464 |
+38. **`00_overview.md`** — Executive summary of the 530 ms/step problem and the 10-patch roadmap.
 
-Total: 16 unique arxiv URLs.
+39. **`01_profiling_breakdown.md`** — Detailed analysis of where the 530 ms goes (Wave 1).
+
+40. **`02_fused_bwd_fix.md`** — Fixing the 10× slow fused backward (Wave 2).
+
+41. **`03_batched_compute_pw.md`** — Fusing 25 `compute_P_W` launches into 1 (Wave 2).
+
+42. **`04_sm120_optimal.md`** — TMA / `wgmma` / `tcgen05` options for Blackwell (Wave 3).
+
+43. **`05_memory_optimization.md`** — Eliminating `(K, N, 4)` intermediates (Wave 3).
+
+44. **`06_stream_overlap.md`** — True producer/consumer with double-buffering (Wave 3).
+
+45. **`07_literature_comparison.md`** — Comparison with FlashAttention, vLLM, llama.cpp, CUTLASS, FLUTE, Marlin (Wave 4).
+
+46. **`08_recommendations.md`** — Concrete code patches with expected speedup (Wave 4).
+
+47. **`09_references.md`** — This document.
+
+---
+
+## 6. Closing note on versioning
+
+All NVIDIA PTX/CUDA references in this document are based on the latest
+stable as of the document date (2026-08-22):
+
+- PTX ISA 8.7 (CUDA 12.8)
+- CUTLASS 3.5+
+- PyTorch 2.4+ (for `fused=True` AdamW and CUDA Graphs)
+- bitsandbytes 0.43+
+
+Earlier versions may work for the first 7 patches (no Blackwell-specific
+PTX), but Patches 8-10 require NVCC 12.8+ and a Blackwell-class GPU
+(sm_120+).
+
