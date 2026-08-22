@@ -979,7 +979,9 @@ def train_super_block(sb_idx, max_steps, lora_rank=16, lora_alpha=32, seq_len=12
         return 0.5 * (1.0 + math.cos(math.pi * (step - WARMUP_STEPS) / max(max_steps - WARMUP_STEPS, 1)))
     sched_muon = torch.optim.lr_scheduler.LambdaLR(opt_muon.opt, lr_lambda) if opt_muon else None
     sched_adamw = torch.optim.lr_scheduler.LambdaLR(opt_adamw.opt, lr_lambda) if opt_adamw else None
-    sched_indices = torch.optim.lr_scheduler.LambdaLR(opt_indices.opt, lr_lambda) if opt_indices else None
+    # opt_indices is bnb.optim.AdamW8bit (Patch 8) — no .opt wrapper indirection.
+    # opt_muon / opt_adamw still use FP32MasterOptimizer wrapper, so they keep .opt.
+    sched_indices = torch.optim.lr_scheduler.LambdaLR(opt_indices, lr_lambda) if opt_indices else None
 
     # If resuming, advance the LR scheduler to the resumed step
     if resume_step > 0:
