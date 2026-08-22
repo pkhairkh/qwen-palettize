@@ -594,13 +594,23 @@ def build_optimizers(model, hp, sb_idx):
     # index_logits optimizer: bitsandbytes AdamW8bit (Patch 8, Wave 1).
     # Replaces FP32MasterAdamW (113 ms/step, 21.4 GB VRAM) with bnb.optim.AdamW8bit
     # (~20 ms/step, 3.56 GB VRAM). 8-bit state (m, v) handles fp16 index_logits
-    # natively — no fp32 master copy needed. eps=1e-8 chosen to match the previous
-    # setup; if fp16 Gumbel-Softmax grads underflow to NaN, raise to 1e-6 (Wave 3).
+    # natively — no fp32 master copy needed.
+    #
+    # eps=1e-6 (Wave 3 defensive bump from 1e-8): 8-bit quantization introduces
+    # ~1/256 state-range noise on dequantization. For tiny Gumbel-Softmax grads
+    # at low τ, sqrt(v)+eps with eps=1e-8 risks underflow → NaN (the original
+    # FP32MasterAdamW had a CRITICAL warning about this for fp16 state). 1e-6 is
+    # the bitsandbytes-recommended floor for 8-bit state and matches the Wave 3
+    # DoD fallback ("if NaN, raise eps to 1e-6"). Cost: slightly slower
+    # convergence; benefit: NaN safety without an fp32 master copy. If NaN still
+    # appears in real training, the existing skip-and-continue guard at line ~1161
+    # (if not torch.isfinite(loss): ... continue) plus the clamp_(-20, 20) at
+    # line ~1209 will keep training stable.
     # See research-filter-consolidation/03_optimizer_speedup.md §Patch 8 (Option B),
     # docs/papers/1412.6980_Adam_Kingma2015.pdf + 1711.05101_AdamW_Loshchilov2019.pdf.
     import bitsandbytes as bnb
     opt_indices = bnb.optim.AdamW8bit(
-        plain_adamw_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0
+        plain_adamw_groups, betas=(0.9, 0.95), eps=1e-6, weight_decay=0.0
     ) if plain_adamw_groups else None
 
     # Per-group counts for visibility
