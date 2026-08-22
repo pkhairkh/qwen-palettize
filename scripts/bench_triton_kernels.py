@@ -26,7 +26,7 @@ from triton_soft_forward import (
 )
 from triton_soft_backward import (
     fused_soft_bwd_grad_x_triton, fused_soft_bwd_grad_W_triton,
-    fused_soft_bwd_elementwise_triton,
+    fused_soft_bwd_elementwise_triton, fused_soft_bwd_chunked_triton,
 )
 from triton_hard_forward import (
     compute_hard_W_triton, fused_hard_matmul_triton, TritonHardLinear,
@@ -315,6 +315,41 @@ def bench_soft_bwd_elementwise(K, N, M):
     }
 
 
+def bench_soft_bwd_chunked(K, N, M):
+    """Patch 18: fused grad_W + elementwise — no HBM grad_W intermediate."""
+    x, palette, logits, _, _, grad_y, G = make_inputs(K, N, M)
+    P_aos, _ = compute_P_W_ste_triton(logits, palette, GROUP_SIZE, 1.5, 42)
+    def triton_fn():
+        fused_soft_bwd_chunked_triton(x, grad_y, P_aos, palette, GROUP_SIZE)
+    # Torch ref (same as bench_soft_bwd_elementwise — two-step: grad_W + elementwise)
+    def torch_fn():
+        grad_W = x.T.float() @ grad_y.float()
+        g_idx = torch.arange(N, device=palette.device) // GROUP_SIZE
+        pal_per_col = palette[g_idx.long()].float()
+        P_aos_f = P_aos.float()
+        W_soft = (P_aos_f * pal_per_col[None, :, :]).sum(dim=-1)
+        pal_b = pal_per_col[None, :, :].expand(K, N, 4)
+        delta = pal_b - W_soft.unsqueeze(-1)
+        _ = (grad_W.unsqueeze(-1) * P_aos_f * delta)  # grad_logits_aos
+    gl_tri, gp_tri = fused_soft_bwd_chunked_triton(x, grad_y, P_aos, palette, GROUP_SIZE)
+    # Correctness: compare grad_logits to two-step reference
+    grad_W_ref = fused_soft_bwd_grad_W_triton(x, grad_y)
+    gl_ref, _ = fused_soft_bwd_elementwise_triton(grad_W_ref, P_aos, palette, GROUP_SIZE)
+    err = (gl_tri.float() - gl_ref.float()).abs().max().item()
+    gl_abs_max = gl_ref.float().abs().max().item()
+    rel_err = err / max(gl_abs_max, 1e-6)
+    t_tri = bench(triton_fn)
+    t_tor = bench(torch_fn)
+    return {
+        'kernel': 'fused_soft_bwd_chunked (grad_W+elementwise fused, no HBM grad_W)',
+        'K': K, 'N': N, 'M': M,
+        'err_gl': err, 'rel_err': rel_err,
+        'correctness': 'PASS' if rel_err < 0.02 else 'FAIL',
+        'triton_ms': t_tri, 'torch_ms': t_tor, 'speedup': t_tor / t_tri if t_tri > 0 else 0,
+        'note': 'Patch 18 — eliminates grad_W HBM intermediate (52MB write + 52MB read per layer)',
+    }
+
+
 def bench_hard_forward(K, N, M):
     x, palette, _, indices, bias, _, G = make_inputs(K, N, M)
     def triton_fn():
@@ -356,7 +391,8 @@ def main():
             print(f"\n--- (K={K}, N={N}, M={M}) ---")
             for fn in [bench_compute_P_W_ste, bench_soft_matmul,
                        bench_soft_bwd_grad_x, bench_soft_bwd_grad_W,
-                       bench_soft_bwd_elementwise, bench_hard_forward]:
+                       bench_soft_bwd_elementwise, bench_soft_bwd_chunked,
+                       bench_hard_forward]:
                 try:
                     r = fn(K, N, M)
                     all_results.append(r)

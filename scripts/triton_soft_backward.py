@@ -334,6 +334,147 @@ def fused_soft_bwd_elementwise_kernel(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# KERNEL 2d — CHUNKED fused grad_W + elementwise (Patch 18)
+# ═════════════════════════════════════════════════════════════════════════════
+# Replaces the two-kernel split (fused_soft_bwd_grad_W_kernel +
+# fused_soft_bwd_elementwise_kernel) with a SINGLE fused kernel that:
+#   1. Computes grad_W_tile = x.T @ grad_y via tl.dot (tensor cores, fp32 acc)
+#      — reducing over M in chunks of BK. The grad_W_tile (BM × BN fp32) lives
+#      in REGISTERS, NEVER written to HBM.
+#   2. Immediately consumes grad_W_tile for the elementwise computation:
+#        grad_logits[k,j,o] = grad_W * P[k,j,o] * (palette[g,k] - W_soft)
+#        grad_palette[g,k] += grad_W * P[k,j,o]  (atomic_add, fp32)
+#
+# This eliminates the 52 MB write + 52 MB read of grad_W per layer × 25 layers
+# = 2.6 GB/step of HBM traffic.
+#
+# FIXED CONFIG (no @triton.autotune): the atomic_add to grad_palette accumulates
+# across autotuner benchmark runs (Triton 3.5 runs the kernel multiple times
+# during benchmarking). Same issue as the existing elementwise kernel (see
+# comment in KERNEL 2c above). BM=128, BN=128, BK=32 chosen to match the
+# elementwise kernel's block size (16K positions per program) + a reasonable
+# BK for the matmul reduction (32 = 2 tensor-core tiles of 16).
+#
+# Constraint: BN <= group_size (256) so each block's columns map to a single
+# group (enables the per-block register accumulation → minimal atomics).
+# For GS=256, BN=128 is safe (2 blocks per group, each does 4 atomic_adds).
+#
+# Register pressure: grad_W_tile (128×128 fp32 = 64 KB) + P_aos (4×128×128 fp32
+# = 256 KB... but only one plane at a time in registers) + palette (4 scalars).
+# Total ~80-100 registers per thread — well within the 255 limit.
+@triton.jit
+def fused_soft_bwd_chunked_kernel(
+    # Inputs
+    x_ptr,            # (M, K) bf16
+    grad_y_ptr,       # (M, N) bf16
+    P_aos_ptr,        # (K, N, 4) fp16 AoS — from forward ctx
+    palette_ptr,      # (G, 4) bf16
+    # Outputs
+    grad_logits_ptr,   # (4, K, N) fp16 — OUTPUT SoA (plane stride = K*N)
+    grad_palette_ptr, # (G, 4) fp32 — OUTPUT (atomic)
+    # Shapes
+    M, N, K, G,
+    # Strides
+    stride_xm, stride_xk,
+    stride_gym, stride_gyn,
+    # Constexprs
+    group_size: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """Fused grad_W (matmul) + elementwise (grad_logits + grad_palette).
+
+    For each (k_tile, n_tile) of output:
+      1. grad_W_tile = x[:, k_tile].T @ grad_y[:, n_tile]  (via tl.dot, fp32 acc)
+         — reduces over M in chunks of BK. Lives in REGISTERS, never HBM.
+      2. Load P_aos[k_tile, n_tile, 0..3] + palette[g, 0..3] from HBM.
+      3. Reconstruct W_soft = Σ P[k] * palette[g, k].
+      4. grad_logits[k, j, o] = grad_W * P[k] * (palette[g, k] - W_soft).
+      5. Atomic_add grad_palette[g, k] += Σ_{j,o in block} grad_W * P[k].
+    """
+    pid_k = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_k = pid_k * BM + tl.arange(0, BM)  # K direction (output row)
+    offs_n = pid_n * BN + tl.arange(0, BN)  # N direction (output col)
+    offs_m = tl.arange(0, BK)                # M direction (reduction)
+
+    # ── 1. Compute grad_W_tile = x.T @ grad_y via tl.dot (fp32 acc) ────────
+    # x tile: (BK, BM) at (m_offset, k_chunk) — x[m, k] at m*stride_xm + k*stride_xk
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    # grad_y tile: (BK, BN) at (m_offset, n_chunk)
+    gy_ptrs = grad_y_ptr + offs_m[:, None] * stride_gym + offs_n[None, :] * stride_gyn
+
+    grad_W_val = tl.zeros((BM, BN), dtype=tl.float32)  # (BM, BN) fp32 — grad_W_tile
+    for m_iter in range(0, tl.cdiv(M, BK)):
+        m_off = m_iter * BK
+        mask_x = ((offs_m[:, None] + m_off) < M) & (offs_k[None, :] < K)
+        mask_gy = ((offs_m[:, None] + m_off) < M) & (offs_n[None, :] < N)
+        x_tile = tl.load(x_ptrs, mask=mask_x, other=0.0)  # (BK, BM) bf16
+        gy_tile = tl.load(gy_ptrs, mask=mask_gy, other=0.0)  # (BK, BN) bf16
+        # tl.dot((BM, BK), (BK, BN)) → (BM, BN) — need x_tile.T
+        x_tile_t = tl.trans(x_tile)  # (BM, BK)
+        grad_W_val += tl.dot(x_tile_t, gy_tile)  # fp32 acc
+
+        x_ptrs += BK * stride_xm
+        gy_ptrs += BK * stride_gym
+
+    # grad_W_val is now (BM, BN) fp32 — LIVES IN REGISTERS, NEVER written to HBM.
+
+    # ── 2. Load P_aos[k, n, 0..3] (4 fp16, AoS) + palette[g, 0..3] ────────
+    mask_k = offs_k < K
+    mask_n = offs_n < N
+    mask = mask_k[:, None] & mask_n[None, :]
+
+    j_grid = offs_k[:, None]   # (BM, 1)
+    o_grid = offs_n[None, :]    # (1, BN)
+    idx_grid = j_grid * N + o_grid  # (BM, BN) — flat (K, N) index
+    g_grid = o_grid // group_size    # (1, BN)
+
+    plane_size = K * N
+
+    paos_base = idx_grid * 4  # (BM, BN)
+    p0 = tl.load(P_aos_ptr + paos_base + 0, mask=mask, other=0.0).to(tl.float32)
+    p1 = tl.load(P_aos_ptr + paos_base + 1, mask=mask, other=0.0).to(tl.float32)
+    p2 = tl.load(P_aos_ptr + paos_base + 2, mask=mask, other=0.0).to(tl.float32)
+    p3 = tl.load(P_aos_ptr + paos_base + 3, mask=mask, other=0.0).to(tl.float32)
+
+    pal_base = g_grid * 4  # (1, BN)
+    c0 = tl.load(palette_ptr + pal_base + 0, mask=mask_n[None, :], other=0.0).to(tl.float32)
+    c1 = tl.load(palette_ptr + pal_base + 1, mask=mask_n[None, :], other=0.0).to(tl.float32)
+    c2 = tl.load(palette_ptr + pal_base + 2, mask=mask_n[None, :], other=0.0).to(tl.float32)
+    c3 = tl.load(palette_ptr + pal_base + 3, mask=mask_n[None, :], other=0.0).to(tl.float32)
+
+    # ── 3. Reconstruct W_soft = Σ P[k] * palette[g, k] ──────────────────────
+    W_soft = p0 * c0 + p1 * c1 + p2 * c2 + p3 * c3  # (BM, BN) f32
+
+    # ── 4. grad_logits[k, j, o] = grad_W * P[k] * (palette[g, k] - W_soft) ──
+    gl0 = (grad_W_val * p0 * (c0 - W_soft)).to(tl.float16)
+    gl1 = (grad_W_val * p1 * (c1 - W_soft)).to(tl.float16)
+    gl2 = (grad_W_val * p2 * (c2 - W_soft)).to(tl.float16)
+    gl3 = (grad_W_val * p3 * (c3 - W_soft)).to(tl.float16)
+    tl.store(grad_logits_ptr + 0 * plane_size + idx_grid, gl0, mask=mask)
+    tl.store(grad_logits_ptr + 1 * plane_size + idx_grid, gl1, mask=mask)
+    tl.store(grad_logits_ptr + 2 * plane_size + idx_grid, gl2, mask=mask)
+    tl.store(grad_logits_ptr + 3 * plane_size + idx_grid, gl3, mask=mask)
+
+    # ── 5. grad_palette[g, k] += Σ_{j,o in block} grad_W * P[k]  (atomic) ──
+    # Same per-block register accumulation as KERNEL 2c (reduces atomics from
+    # BM*BN to 4 per block). Zero out OOB positions before summing.
+    grad_W_masked = tl.where(mask, grad_W_val, 0.0)
+    contrib0 = tl.sum(grad_W_masked * p0, axis=None)  # scalar
+    contrib1 = tl.sum(grad_W_masked * p1, axis=None)
+    contrib2 = tl.sum(grad_W_masked * p2, axis=None)
+    contrib3 = tl.sum(grad_W_masked * p3, axis=None)
+
+    gp_off = pid_n * BN // group_size  # scalar group index for this block
+    if pid_n * BN < N:
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 0, contrib0)
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 1, contrib1)
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 2, contrib2)
+        tl.atomic_add(grad_palette_ptr + gp_off * 4 + 3, contrib3)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Python launchers
 # ═════════════════════════════════════════════════════════════════════════════
 # ── Patch 17: Buffer pooling for grad_W (backward intermediate) ─────────────
@@ -462,6 +603,75 @@ def fused_soft_bwd_elementwise_triton(
         K, N, G,
         group_size=group_size,
         BM=BM, BN=BN,
+        num_warps=8,
+        num_stages=1,
+    )
+    return grad_logits, grad_palette
+
+
+def fused_soft_bwd_chunked_triton(
+    x: torch.Tensor,        # (M, K) bf16
+    grad_y: torch.Tensor,    # (M, N) bf16
+    P_aos: torch.Tensor,     # (K, N, 4) fp16 AoS
+    palette: torch.Tensor,   # (G, 4) bf16
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Patch 18: fused grad_W + elementwise — NO HBM grad_W intermediate.
+
+    Replaces the two-kernel split (fused_soft_bwd_grad_W_triton +
+    fused_soft_bwd_elementwise_triton) with a single kernel that:
+      1. Computes grad_W_tile = x.T @ grad_y via tl.dot (tensor cores, fp32 acc)
+         — the tile lives in REGISTERS, never written to HBM.
+      2. Immediately consumes grad_W_tile for grad_logits + grad_palette.
+
+    This eliminates the 52 MB write + 52 MB read of grad_W per layer
+    × 25 layers = 2.6 GB/step of HBM traffic.
+
+    Returns (grad_logits (4,K,N) fp16 SoA, grad_palette (G,4) fp32) — same
+    outputs as the two-kernel split. Math is identical.
+
+    The old two-kernel split is kept for backward compatibility (callers that
+    need the intermediate grad_W can still call fused_soft_bwd_grad_W_triton
+    + fused_soft_bwd_elementwise_triton).
+    """
+    assert x.dtype == torch.bfloat16
+    assert grad_y.dtype == torch.bfloat16
+    assert P_aos.dtype == torch.float16
+    assert palette.dtype == torch.bfloat16
+    M, K = x.shape
+    M2, N = grad_y.shape
+    K2, N2, _ = P_aos.shape
+    G, _ = palette.shape
+    assert M == M2, f"M mismatch: x.M={M} vs grad_y.M={M2}"
+    assert K == K2, f"K mismatch: x.K={K} vs P_aos.K={K2}"
+    assert N == N2, f"N mismatch: grad_y.N={N} vs P_aos.N={N2}"
+    assert N // group_size == G, f"G mismatch: N//GS={N//group_size} vs G={G}"
+
+    x = x.contiguous()
+    grad_y = grad_y.contiguous()
+    P_aos = P_aos.contiguous()
+    palette = palette.contiguous()
+
+    # grad_logits and grad_palette are RETURNED to autograd — cannot be pooled.
+    grad_logits = torch.empty((4, K, N), dtype=torch.float16, device=P_aos.device)
+    grad_palette = torch.zeros((G, 4), dtype=torch.float32, device=palette.device)
+
+    # FIXED CONFIG (no @triton.autotune): the atomic_add to grad_palette
+    # accumulates across autotuner benchmark runs (Triton 3.5 runs the kernel
+    # multiple times during benchmarking). Same issue as the existing elementwise
+    # kernel. BM=128, BN=128 → 16K positions per program (16x more than the
+    # original 32×32 disaster). BK=32 → 2 tensor-core tiles per matmul iteration.
+    # Constraint: BN <= group_size (256) so each block touches exactly ONE group.
+    BM, BN, BK = 128, 128, 32
+    grid = (triton.cdiv(K, BM), triton.cdiv(N, BN))
+    fused_soft_bwd_chunked_kernel[grid](
+        x, grad_y, P_aos, palette,
+        grad_logits, grad_palette,
+        M, N, K, G,
+        x.stride(0), x.stride(1),
+        grad_y.stride(0), grad_y.stride(1),
+        group_size=group_size,
+        BM=BM, BN=BN, BK=BK,
         num_warps=8,
         num_stages=1,
     )

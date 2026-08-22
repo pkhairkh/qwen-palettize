@@ -685,15 +685,19 @@ class TritonSoftLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y):
-        # Wave 2 — fused Triton backward. Three kernels:
+        # Wave 2 — fused Triton backward.
         #   1. grad_x = grad_y @ W_ste.T            (Triton TC matmul)
-        #   2. grad_W_soft = x.T @ grad_y           (Triton TC matmul, fp32 output)
-        #   3. elementwise: grad_logits + atomic grad_palette from P_aos + palette
+        #   2. grad_logits + grad_palette via Patch 18 chunked kernel:
+        #      - Computes grad_W = x.T @ grad_y via tl.dot (tensor cores, fp32 acc)
+        #        — the grad_W tile lives in REGISTERS, never written to HBM.
+        #      - Immediately consumes grad_W for grad_logits + grad_palette.
+        #      Replaces the two-kernel split (fused_soft_bwd_grad_W_triton +
+        #      fused_soft_bwd_elementwise_triton) — eliminates 52 MB write +
+        #      52 MB read of grad_W per layer × 25 = 2.6 GB/step HBM traffic.
         # Math matches existing CUDA `fused_lut_linear_soft_bwd_fused_aos_kernel`.
         from triton_soft_backward import (
             fused_soft_bwd_grad_x_triton,
-            fused_soft_bwd_grad_W_triton,
-            fused_soft_bwd_elementwise_triton,
+            fused_soft_bwd_chunked_triton,
         )
         x, palette, logits, P_aos, W_ste = ctx.saved_tensors
         grad_y = grad_y.contiguous()
@@ -712,15 +716,13 @@ class TritonSoftLinear(torch.autograd.Function):
         if needs_grad_x:
             grad_x = fused_soft_bwd_grad_x_triton(grad_y, W_ste)
 
-        # ── 2 + 3. grad_logits + grad_palette (compute grad_W on-the-fly via matmul)
+        # ── 2. grad_logits + grad_palette via Patch 18 chunked kernel ────────
+        # Fused grad_W (matmul) + elementwise — no HBM grad_W intermediate.
         grad_logits = None
         grad_palette = None
         if needs_grad_logits or needs_grad_palette:
-            # grad_W_soft = x.T @ grad_y (fp32, for elementwise precision)
-            grad_W = fused_soft_bwd_grad_W_triton(x, grad_y)
-            # elementwise: grad_logits + atomic grad_palette
-            grad_logits, grad_palette = fused_soft_bwd_elementwise_triton(
-                grad_W, P_aos, palette, GS
+            grad_logits, grad_palette = fused_soft_bwd_chunked_triton(
+                x, grad_y, P_aos, palette, GS
             )
             if not needs_grad_logits:
                 grad_logits = None
