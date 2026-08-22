@@ -1862,6 +1862,167 @@ void fused_lut_linear_soft_bwd_fused_aos_Launcher(
         M, K, N, group_size);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  LIGHTWEIGHT soft backward kernel — takes grad_W from cuBLAS (no internal matmul)
+//
+//  This kernel does ONLY elementwise ops:
+//    grad_logits[j,o,k] = grad_W[j,o] * P[j,o,k] * (palette[g,k] - W_soft[j,o])
+//    grad_palette[g,k] += grad_W[j,o] * P[j,o,k]  (atomicAdd)
+//
+//  grad_W = x.T @ grad_y is computed by cuBLAS (TC, ~0.06ms) before calling this.
+//  grad_x = grad_y @ W.T is computed by cuBLAS after this.
+//
+//  This avoids the 10× slow scalar FMA M-loop of the old fused kernel.
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void soft_bwd_elementwise_aos_kernel(
+    const __nv_bfloat16* __restrict__ grad_W,     // (K, N) bf16 — from cuBLAS
+    const __half*        __restrict__ P_aos,      // (K, N, 4) fp16 — AoS
+    const __nv_bfloat16* __restrict__ palette,    // (G, 4) bf16
+    __half*              __restrict__ grad_logits, // (4, K, N) fp16 — SoA output
+    float*               __restrict__ grad_palette, // (G, 4) fp32 — atomicAdd
+    int K, int N, int group_size
+) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int o = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= K || o >= N) return;
+
+    const int g = o / group_size;
+    const int idx = j * N + o;
+    const int idx_aos = idx * 4;
+    const int plane_size = K * N;
+
+    // Load grad_W (bf16 → fp32)
+    float gw = __bfloat162float(grad_W[idx]);
+
+    // Load P[j,o,0..3] — AoS, coalesced 64-bit load
+    float p0 = __half2float(P_aos[idx_aos + 0]);
+    float p1 = __half2float(P_aos[idx_aos + 1]);
+    float p2 = __half2float(P_aos[idx_aos + 2]);
+    float p3 = __half2float(P_aos[idx_aos + 3]);
+
+    // Load palette[g, 0..3]
+    float c0 = __bfloat162float(palette[g * 4 + 0]);
+    float c1 = __bfloat162float(palette[g * 4 + 1]);
+    float c2 = __bfloat162float(palette[g * 4 + 2]);
+    float c3 = __bfloat162float(palette[g * 4 + 3]);
+
+    // W_soft[j,o] = sum_k P[k] * palette[g,k]
+    float W_soft = c0 * p0 + c1 * p1 + c2 * p2 + c3 * p3;
+
+    // grad_logits[j,o,k] = grad_W * P[k] * (palette[g,k] - W_soft)
+    // Output SoA (4, K, N) — 4 strided stores (write-once, acceptable)
+    grad_logits[0 * plane_size + idx] = __float2half(gw * p0 * (c0 - W_soft));
+    grad_logits[1 * plane_size + idx] = __float2half(gw * p1 * (c1 - W_soft));
+    grad_logits[2 * plane_size + idx] = __float2half(gw * p2 * (c2 - W_soft));
+    grad_logits[3 * plane_size + idx] = __float2half(gw * p3 * (c3 - W_soft));
+
+    // grad_palette[g,k] += grad_W * P[k]  (atomicAdd)
+    atomicAdd(&grad_palette[g * 4 + 0], gw * p0);
+    atomicAdd(&grad_palette[g * 4 + 1], gw * p1);
+    atomicAdd(&grad_palette[g * 4 + 2], gw * p2);
+    atomicAdd(&grad_palette[g * 4 + 3], gw * p3);
+}
+
+void soft_bwd_elementwise_aos_Launcher(
+    const c10::BFloat16* grad_W,
+    const c10::Half* P_aos,
+    const c10::BFloat16* palette,
+    c10::Half* grad_logits,
+    float* grad_palette,
+    int K, int N, int group_size
+) {
+    dim3 grid((K + 15) / 16, (N + 15) / 16);
+    dim3 block(16, 16);
+    soft_bwd_elementwise_aos_kernel<<<grid, block, 0, 0>>>(
+        reinterpret_cast<const __nv_bfloat16*>(grad_W),
+        reinterpret_cast<const __half*>(P_aos),
+        reinterpret_cast<const __nv_bfloat16*>(palette),
+        reinterpret_cast<__half*>(grad_logits),
+        grad_palette,
+        K, N, group_size);
+}
+
+// Also add: compute_P_W_aos + W_hard kernel (fuses argmax into forward)
+__global__ void compute_P_W_hard_aos_kernel(
+    const __half*        __restrict__ logits,    // (4, K, N) fp16 — SoA input
+    const __nv_bfloat16* __restrict__ palette,   // (G, 4) bf16
+    __half*              __restrict__ P_aos,     // (K, N, 4) fp16 — AoS output
+    __nv_bfloat16*       __restrict__ W_soft,    // (K, N) bf16
+    __nv_bfloat16*       __restrict__ W_hard,     // (K, N) bf16 — NEW: argmax result
+    int K, int N, int group_size,
+    float tau, uint32_t step_seed
+) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int o = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= K || o >= N) return;
+
+    const int g = o / group_size;
+    const int idx = j * N + o;
+    const int idx_aos = idx * 4;
+    const int plane_size = K * N;
+
+    // Load 4 logits
+    float l0 = __half2float(logits[0 * plane_size + idx]);
+    float l1 = __half2float(logits[1 * plane_size + idx]);
+    float l2 = __half2float(logits[2 * plane_size + idx]);
+    float l3 = __half2float(logits[3 * plane_size + idx]);
+
+    // Gumbel + softmax
+    float inv_tau = 1.0f / tau;
+    float n0 = (l0 + gumbel_sample(step_seed, idx * 4 + 0)) * inv_tau;
+    float n1 = (l1 + gumbel_sample(step_seed, idx * 4 + 1)) * inv_tau;
+    float n2 = (l2 + gumbel_sample(step_seed, idx * 4 + 2)) * inv_tau;
+    float n3 = (l3 + gumbel_sample(step_seed, idx * 4 + 3)) * inv_tau;
+    float m = fmaxf(fmaxf(n0, n1), fmaxf(n2, n3));
+    float e0 = expf(n0 - m), e1 = expf(n1 - m), e2 = expf(n2 - m), e3 = expf(n3 - m);
+    float s = e0 + e1 + e2 + e3;
+    float p0 = e0/s, p1 = e1/s, p2 = e2/s, p3 = e3/s;
+
+    // Write P in AoS
+    P_aos[idx_aos + 0] = __float2half(p0);
+    P_aos[idx_aos + 1] = __float2half(p1);
+    P_aos[idx_aos + 2] = __float2half(p2);
+    P_aos[idx_aos + 3] = __float2half(p3);
+
+    // Load palette
+    float c0 = __bfloat162float(palette[g * 4 + 0]);
+    float c1 = __bfloat162float(palette[g * 4 + 1]);
+    float c2 = __bfloat162float(palette[g * 4 + 2]);
+    float c3 = __bfloat162float(palette[g * 4 + 3]);
+
+    // W_soft = sum P * palette
+    W_soft[idx] = __float2bfloat16(p0*c0 + p1*c1 + p2*c2 + p3*c3);
+
+    // W_hard = palette[argmax(logits)] — NO Python argmax needed!
+    // argmax of logits = argmax of P (same ordering since P = softmax(logits/tau))
+    float max_val = p0; int max_idx = 0;
+    if (p1 > max_val) { max_val = p1; max_idx = 1; }
+    if (p2 > max_val) { max_val = p2; max_idx = 2; }
+    if (p3 > max_val) { max_val = p3; max_idx = 3; }
+    float wh = (max_idx == 0) ? c0 : (max_idx == 1) ? c1 : (max_idx == 2) ? c2 : c3;
+    W_hard[idx] = __float2bfloat16(wh);
+}
+
+void compute_P_W_hard_aos_Launcher(
+    const c10::Half* logits,
+    const c10::BFloat16* palette,
+    c10::Half* P_aos,
+    c10::BFloat16* W_soft,
+    c10::BFloat16* W_hard,
+    int K, int N, int group_size,
+    float tau, uint32_t step_seed
+) {
+    dim3 grid((K + 15) / 16, (N + 15) / 16);
+    dim3 block(16, 16);
+    compute_P_W_hard_aos_kernel<<<grid, block, 0, 0>>>(
+        reinterpret_cast<const __half*>(logits),
+        reinterpret_cast<const __nv_bfloat16*>(palette),
+        reinterpret_cast<__half*>(P_aos),
+        reinterpret_cast<__nv_bfloat16*>(W_soft),
+        reinterpret_cast<__nv_bfloat16*>(W_hard),
+        K, N, group_size, tau, step_seed);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  PATCH 7 — Batched compute_P_W (25 launches → 1)
 //
